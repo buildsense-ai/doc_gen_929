@@ -1,0 +1,16 @@
+2025-08-08 22:06:48,654 - Document_Agent.final_review_agent.document_reviewer - INFO - ✅ DocumentReviewer 初始化完成
+2025-08-08 22:06:48,655 - Document_Agent.final_review_agent.document_reviewer - INFO - [95m
+🔍 开始文档质量分析: c:\Users\heyyy\Desktop\Gauz文档Agent\完整版文档_20250808_182026.md[0m
+2025-08-08 22:06:48,655 - Document_Agent.final_review_agent.document_reviewer - INFO - 📄 文档内容长度: 58437字符
+2025-08-08 22:06:48,656 - Document_Agent.final_review_agent.document_reviewer - INFO - [92m🤖 API调用: 发送冗余分析请求到OpenRouter API，内容长度: 59549字符[0m
+2025-08-08 22:07:04,244 - httpx - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2025-08-08 22:07:32,567 - Document_Agent.final_review_agent.document_reviewer - INFO - [96m📡 API响应: API调用成功，响应长度: 1181 字符[0m
+2025-08-08 22:07:32,569 - Document_Agent.final_review_agent.document_reviewer - INFO - ✅ 简化分析完成，发现 8 个需要修改的地方
+2025-08-08 22:20:59,124 - Document_Agent.final_review_agent.document_reviewer - INFO - ✅ DocumentReviewer 初始化完成
+2025-08-08 22:20:59,124 - Document_Agent.final_review_agent.document_reviewer - INFO - [95m
+🔍 开始文档质量分析: C:\Users\heyyy\Desktop\Gauz文档Agent\完整版文档_20250808_182026.md[0m
+2025-08-08 22:20:59,125 - Document_Agent.final_review_agent.document_reviewer - INFO - 📄 文档内容长度: 58437字符
+2025-08-08 22:20:59,125 - Document_Agent.final_review_agent.document_reviewer - INFO - [92m🤖 API调用: 发送冗余分析请求到OpenRouter API，内容长度: 59538字符[0m
+2025-08-08 22:21:02,824 - httpx - INFO - HTTP Request: POST https://openrouter.ai/api/v1/chat/completions "HTTP/1.1 200 OK"
+2025-08-08 22:22:05,079 - Document_Agent.final_review_agent.document_reviewer - INFO - [96m📡 API响应: API调用成功，响应长度: 1395 字符[0m
+2025-08-08 22:22:05,081 - Document_Agent.final_review_agent.document_reviewer - INFO - ✅ 简化分析完成，发现 10 个需要修改的地方
