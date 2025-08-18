@@ -14,7 +14,7 @@ sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Docume
 SYSTEM_CONFIG = {
     # OpenRouter配置
     'openrouter': {
-        'api_key': 'your-api-key',
+        'api_key': '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',
         'base_url': 'https://openrouter.ai/api/v1',
         'model': 'google/gemini-2.5-flash',
         'max_tokens': 10000,

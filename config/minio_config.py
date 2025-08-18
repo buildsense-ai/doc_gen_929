@@ -35,11 +35,18 @@ class MinIOConfig:
         self.bucket_name = os.getenv('MINIO_BUCKET_NAME', 'gauz-documents')
         self.region = os.getenv('MINIO_REGION', 'us-east-1')
         
-        # URL有效期配置（默认24小时）
+        # URL有效期配置（默认7天=168小时；预签名模式有效）
         self.url_expiry_hours = int(os.getenv('MINIO_URL_EXPIRY_HOURS', '168'))
         
         # 文件路径前缀
         self.path_prefix = os.getenv('MINIO_PATH_PREFIX', 'documents')
+
+        # 公开桶直链配置
+        # 当 public_bucket 为 True 时，返回永久直链而非预签名URL
+        self.public_bucket = os.getenv('MINIO_PUBLIC_BUCKET', 'false').lower() == 'true'
+        # 可选：自定义直链基址（如走反向代理/CDN）；若未配置则使用 endpoint 推导
+        # 示例：MINIO_PUBLIC_BASE_URL=http://43.139.19.144:9000
+        self.public_base_url = os.getenv('MINIO_PUBLIC_BASE_URL', '').strip()
 
 class MinIOClient:
     """MinIO客户端管理类"""
@@ -149,32 +156,30 @@ class MinIOClient:
     
     def get_download_url(self, object_name: str) -> Optional[str]:
         """
-        获取文件的预签名下载URL
+        获取文件的公开直链URL（仅支持公开桶场景）
         
         Args:
             object_name: MinIO中的对象名称
             
         Returns:
-            预签名URL，失败返回None
+            公开直链URL，失败返回None
         """
         if not self.client or not self.is_available():
             logger.error("❌ MinIO客户端不可用")
             return None
         
         try:
-            # 生成预签名URL
-            url = self.client.presigned_get_object(
-                bucket_name=self.config.bucket_name,
-                object_name=object_name,
-                expires=timedelta(hours=self.config.url_expiry_hours)
-            )
-            
-            logger.info(f"🔗 生成下载URL: {object_name}")
-            return url
-            
-        except S3Error as e:
-            logger.error(f"❌ 生成下载URL失败: {e}")
-            return None
+            scheme = 'https' if self.config.secure else 'http'
+            if self.config.public_base_url:
+                base = self.config.public_base_url.rstrip('/')
+                if base.endswith(f"/{self.config.bucket_name}"):
+                    direct_url = f"{base}/{object_name}"
+                else:
+                    direct_url = f"{base}/{self.config.bucket_name}/{object_name}"
+            else:
+                direct_url = f"{scheme}://{self.config.endpoint}/{self.config.bucket_name}/{object_name}"
+            logger.info(f"🔗 生成直链URL: {direct_url}")
+            return direct_url
         except Exception as e:
             logger.error(f"❌ URL生成异常: {e}")
             return None
