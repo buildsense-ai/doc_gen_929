@@ -68,7 +68,7 @@ class ColoredLogger:
 class DocumentReviewer:
     """文档质量评估器"""
     
-    def __init__(self, api_key: str = "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"):
+    def __init__(self, api_key: str = "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"):
         """
         初始化文档评估器
         
