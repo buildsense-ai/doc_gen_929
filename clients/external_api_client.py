@@ -164,7 +164,7 @@ class ExternalAPIClient:
             "mode": "api_client"
         }
     
-    def template_search(self, query: str, max_retries: int = 3) -> Optional[str]:
+    def template_search(self, query: str, max_retries: int = 3) -> Optional[Any]:
         """
         模板搜索
         
@@ -173,7 +173,10 @@ class ExternalAPIClient:
             max_retries: 最大重试次数
             
         Returns:
-            Optional[str]: 模板内容，失败时返回None
+            Optional[Any]:
+                - 新接口：{"content": 模板内容字符串, "template_id": 可选ID, "raw": 原始响应}
+                - 兼容旧接口：{"content": 模板内容字符串, "template_id": None, "raw": 原始响应}
+                - 失败时返回 None
         """
         if not self.template_available:
             self.logger.error("❌ 模板搜索服务不可用")
@@ -182,7 +185,7 @@ class ExternalAPIClient:
         # 使用同步方式调用异步函数
         return asyncio.run(self._template_search_async(query, max_retries))
     
-    async def _template_search_async(self, query: str, max_retries: int = 3) -> Optional[str]:
+    async def _template_search_async(self, query: str, max_retries: int = 3) -> Optional[Any]:
         """异步模板搜索"""
         try:
             self.logger.info(f"🔍 API模板搜索: {query}")
@@ -200,8 +203,9 @@ class ExternalAPIClient:
             
             # 检查响应格式并提取模板内容
             if response.get("success"):
-                # 新的API响应格式: {"success": true, "data": "...", "message": "..."}
+                # 新的API响应格式: {"success": true, "data": "...", "template_id": "...", "message": "..."}
                 template_content = response.get("data", "")
+                template_id = response.get("template_id")
                 
                 # 检查是否真的找到了模板（而不是"未找到匹配模板"的消息）
                 if "未找到" in template_content or "没有找到" in template_content or "建议尝试" in template_content:
@@ -210,8 +214,8 @@ class ExternalAPIClient:
                     return None
                 
                 response_time = time.time() - start_time
-                self.logger.info(f"✅ 模板搜索成功: 耗时 {response_time:.2f}s, 内容长度 {len(template_content)} 字符")
-                return template_content
+                self.logger.info(f"✅ 模板搜索成功: 耗时 {response_time:.2f}s, 内容长度 {len(template_content)} 字符, 模板ID: {template_id}")
+                return {"content": template_content, "template_id": template_id, "raw": response}
             else:
                 # 旧的API响应格式: {"template_content": "..."}
                 template_content = response.get("template_content", "")
@@ -223,7 +227,7 @@ class ExternalAPIClient:
                 
                 response_time = time.time() - start_time
                 self.logger.info(f"✅ 模板搜索成功: 耗时 {response_time:.2f}s, 内容长度 {len(template_content)} 字符")
-                return template_content
+                return {"content": template_content, "template_id": None, "raw": response}
             
         except Exception as e:
             self.logger.error(f"❌ 模板搜索失败: {e}")

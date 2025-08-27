@@ -113,11 +113,11 @@ class EnhancedOrchestratorAgent:
             self.orchestration_stats['template_search_calls'] += 1
             
             # 使用外部API查询模板
-            template_content = self.external_api.template_search(template_query)
+            template_result = self.external_api.template_search(template_query)
             
             api_response_time = time.time() - api_start_time
             
-            if not template_content:
+            if not template_result:
                 self.logger.info("📭 外部API未找到相关模板")
                 if self.has_smart_control:
                     self.concurrency_manager.record_api_request(
@@ -137,7 +137,15 @@ class EnhancedOrchestratorAgent:
                 )
             self.orchestration_stats['template_search_success'] += 1
             
-            self.logger.info(f"📬 外部API返回模板内容，长度: {len(template_content)} 字符")
+            # 兼容新旧返回：新返回是 dict，含 content 与 template_id
+            if isinstance(template_result, dict):
+                template_content = template_result.get('content', '')
+                template_id = template_result.get('template_id')
+            else:
+                template_content = str(template_result)
+                template_id = None
+
+            self.logger.info(f"📬 外部API返回模板内容，长度: {len(template_content)} 字符，template_id: {template_id}")
             
             # 尝试解析模板内容为文档结构
             template = self._extract_template_from_api_response(template_content)
@@ -146,6 +154,9 @@ class EnhancedOrchestratorAgent:
                 try:
                     self._validate_document_structure(template)
                     self.logger.info("✅ 找到有效的文档结构模板！")
+                    # 将模板ID携带到结构中，便于下游落盘
+                    if template_id:
+                        template['template_id'] = template_id
                     return template
                 except ValueError as e:
                     self.logger.warning(f"⚠️ 模板结构验证失败: {e}")
