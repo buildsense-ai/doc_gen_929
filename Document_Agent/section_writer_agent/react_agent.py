@@ -130,43 +130,48 @@ class EnhancedReactAgent:
         return self.max_workers
 
     def process_report_guide(self, report_guide_data: Dict[str, Any], project_name: str = "医灵古庙") -> Dict[str, Any]:
-        """处理完整的报告指南 - 主入口 (并行处理)"""
+        """处理完整的报告指南 - 主入口 (并行处理顶层，递归处理所有层级)"""
         self.colored_logger.logger.info(f"🤖 ReAct开始并行处理报告指南... (项目: {project_name}, 线程数: {self.max_workers})")
         result_data = json.loads(json.dumps(report_guide_data))
         self.current_project_name = project_name  # 存储项目名称供后续使用
-        
+
+        # 并行仅用于顶层sections，子层级在各自任务中递归串行处理，降低任务调度开销
         tasks = []
         for part in result_data.get('report_guide', []):
             part_context = {'title': part.get('title', ''), 'goal': part.get('goal', '')}
             for section in part.get('sections', []):
-                tasks.append((section, part_context))
+                tasks.append((section, part_context, [part_context.get('title', '')]))
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            future_to_section = {
-                executor.submit(self._process_section_with_react, section, part_context): section
-                for section, part_context in tasks
+            future_to_payload = {
+                executor.submit(self._process_node_recursive, section, part_context, breadcrumb): (section, part_context)
+                for section, part_context, breadcrumb in tasks
             }
-            for future in concurrent.futures.as_completed(future_to_section):
-                section = future_to_section[future]
+            for future in concurrent.futures.as_completed(future_to_payload):
                 try:
-                    # 获取处理结果
-                    result = future.result()
-                    
-                    # 检查结果类型，如果是字典则分别存储三个字段，否则存储为retrieved_data
-                    if isinstance(result, dict) and all(key in result for key in ['retrieved_text', 'retrieved_image', 'retrieved_table']):
-                        section['retrieved_text'] = result['retrieved_text']
-                        section['retrieved_image'] = result['retrieved_image'] 
-                        section['retrieved_table'] = result['retrieved_table']
-                    else:
-                        # 向后兼容：如果返回字符串，则存储为retrieved_data
-                        section['retrieved_data'] = result
+                    future.result()
                 except Exception as exc:
+                    section, _ = future_to_payload[future]
                     error_message = f"章节 '{section.get('subtitle')}' 在并行处理中发生错误: {exc}"
                     self.colored_logger.error(error_message)
                     section['retrieved_data'] = error_message
-        
+
         self.colored_logger.logger.info("\n✅ 所有章节并行处理完成！")
         return result_data
+
+    def _process_node_recursive(self, node: Dict[str, Any], part_context: Dict[str, str], breadcrumb: List[str]) -> None:
+        """对单个节点执行ReAct，并递归处理其子节点。"""
+        result = self._process_section_with_react(node, part_context)
+        if isinstance(result, dict) and all(k in result for k in ['retrieved_text', 'retrieved_image', 'retrieved_table']):
+            node['retrieved_text'] = result['retrieved_text']
+            node['retrieved_image'] = result['retrieved_image']
+            node['retrieved_table'] = result['retrieved_table']
+        else:
+            node['retrieved_data'] = result
+
+        # 递归处理子节点
+        for child in node.get('subsections', []) or []:
+            self._process_node_recursive(child, part_context, breadcrumb + [node.get('subtitle', '')])
 
     def _process_section_with_react(self, section_data: dict, part_context: dict) -> str:
         """为单个章节启动并管理ReAct处理流程。"""

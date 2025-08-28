@@ -65,14 +65,25 @@ class JSONDocumentMerger:
         clean_title = section_title.replace("##", "").strip()
         
         report_guide = self.original_data.get('report_guide', [])
-        
+
+        def walk_sections(parent_index: int, sections: List[Dict[str, Any]], path: List[int]) -> Optional[Tuple[int, List[int]]]:
+            for idx, sec in enumerate(sections):
+                subtitle = sec.get('subtitle', '').strip()
+                if subtitle == clean_title:
+                    print(f"✓ 在JSON中找到章节: {clean_title} (位置: part={parent_index}, path={path + [idx]})")
+                    return parent_index, path + [idx]
+                # 递归查找子节点
+                if sec.get('subsections'):
+                    found = walk_sections(parent_index, sec.get('subsections', []), path + [idx])
+                    if found is not None:
+                        return found
+            return None
+
         for title_idx, title_section in enumerate(report_guide):
             sections = title_section.get('sections', [])
-            for section_idx, section in enumerate(sections):
-                subtitle = section.get('subtitle', '').strip()
-                if subtitle == clean_title:
-                    print(f"✓ 在JSON中找到章节: {clean_title} (位置: {title_idx}-{section_idx})")
-                    return title_idx, section_idx
+            found = walk_sections(title_idx, sections, [])
+            if found is not None:
+                return found
         
         print(f"⚠ 在JSON中未找到章节: {clean_title}")
         return None, None
@@ -92,27 +103,33 @@ class JSONDocumentMerger:
         replaced_count = 0
         
         for section_title, section_data in self.regenerated_sections.items():
-            title_idx, section_idx = self.find_section_in_json(section_title)
-            
-            if title_idx is not None and section_idx is not None:
-                # 获取原始章节数据
-                original_section = merged_data['report_guide'][title_idx]['sections'][section_idx]
+            title_idx, index_path = self.find_section_in_json(section_title)
+
+            if title_idx is not None and index_path is not None:
+                # 获取原始章节数据（根据路径深入）
+                original_section = merged_data['report_guide'][title_idx]
+                current = original_section.get('sections', [])
+                for depth, idx in enumerate(index_path):
+                    target = current[idx]
+                    if depth == len(index_path) - 1:
+                        original_section = target
+                    else:
+                        current = target.get('subsections', [])
                 
                 # 更新章节内容，保留原有的其他字段（包括图片和表格信息）
                 content = section_data['content']
                 
-                # 检查并移除重复的标题
+                # 检查并移除重复的标题（支持任意级别#）
                 subtitle = original_section.get('subtitle', '')
-                if content.strip().startswith(f"## {subtitle}"):
-                    # 移除标题行
-                    lines = content.split('\n')
-                    if lines and lines[0].strip() == f"## {subtitle}":
-                        content = '\n'.join(lines[1:]).strip()
-                elif content.strip().startswith(subtitle):
-                    # 移除纯文本标题
-                    if content.strip().split('\n')[0].strip() == subtitle:
-                        lines = content.split('\n')
-                        content = '\n'.join(lines[1:]).strip()
+                first_line = content.strip().split('\n', 1)[0].strip()
+                import re as _re
+                header_pattern = _re.compile(rf"^\s*#{{1,6}}\s*{_re.escape(subtitle)}\s*$")
+                if header_pattern.match(first_line):
+                    parts = content.split('\n', 1)
+                    content = parts[1].lstrip() if len(parts) > 1 else ''
+                elif first_line == subtitle:
+                    parts = content.split('\n', 1)
+                    content = parts[1].lstrip() if len(parts) > 1 else ''
                 
                 # 只更新生成的内容，保留原始的retrieved_image和retrieved_table等字段
                 original_section['generated_content'] = content

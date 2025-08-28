@@ -159,7 +159,18 @@ class DocumentGenerationPipeline:
             document_guide = self.orchestrator.generate_complete_guide(user_query)
             
             step1_time = time.time() - step1_start
-            sections_count = sum(len(part.get('sections', [])) for part in document_guide.get('report_guide', []))
+            def _count_sections_recursive(parts):
+                total = 0
+                for p in parts:
+                    for s in p.get('sections', []):
+                        total += 1
+                        stack = s.get('subsections', []) or []
+                        while stack:
+                            node = stack.pop()
+                            total += 1
+                            stack.extend(node.get('subsections', []) or [])
+                return total
+            sections_count = _count_sections_recursive(document_guide.get('report_guide', []))
             
             print(f"✅ 文档结构生成完成！")
             print(f"   📊 生成了 {len(document_guide.get('report_guide', []))} 个主要部分，{sections_count} 个子章节")

@@ -700,22 +700,39 @@ class EnhancedOrchestratorAgent:
         report_guide = structure['report_guide']
         if not isinstance(report_guide, list) or len(report_guide) == 0:
             raise ValueError("'report_guide' 必须是非空列表")
-        
+
+        def _validate_sections(sections: List[Dict[str, Any]], part_index: int, ancestry: List[str]) -> None:
+            if not isinstance(sections, list):
+                raise ValueError(f"第{part_index+1}个部分的sections必须是列表")
+            if len(sections) == 0:
+                raise ValueError(f"第{part_index+1}个部分的sections不能为空")
+            for j, section in enumerate(sections):
+                if not isinstance(section, dict):
+                    raise ValueError(f"第{part_index+1}个部分的第{j+1}个章节必须是字典")
+                subtitle = section.get('subtitle')
+                if not subtitle or not isinstance(subtitle, str):
+                    raise ValueError(f"第{part_index+1}个部分的第{j+1}个章节缺少有效subtitle")
+                # 校验可选的递归子章节
+                if 'subsections' in section:
+                    subsections = section['subsections']
+                    if not isinstance(subsections, list):
+                        raise ValueError(f"'{subtitle}' 的subsections必须为列表")
+                    if len(subsections) > 0:
+                        _validate_sections(subsections, part_index, ancestry + [subtitle])
+
         for i, part in enumerate(report_guide):
             if not isinstance(part, dict):
                 raise ValueError(f"第{i+1}个部分必须是字典类型")
-            
+
             if 'title' not in part or not part['title']:
                 raise ValueError(f"第{i+1}个部分缺少标题")
-            
-            if 'sections' not in part or not isinstance(part['sections'], list) or len(part['sections']) == 0:
-                raise ValueError(f"第{i+1}个部分缺少章节或章节为空")
-            
-            for j, section in enumerate(part['sections']):
-                if not isinstance(section, dict) or 'subtitle' not in section or not section['subtitle']:
-                    raise ValueError(f"第{i+1}个部分的第{j+1}个章节格式错误")
-        
-        self.logger.debug(f"✅ 文档结构验证通过: {len(report_guide)} 个部分")
+
+            sections = part.get('sections')
+            if sections is None:
+                raise ValueError(f"第{i+1}个部分缺少sections")
+            _validate_sections(sections, i, [part.get('title', f'Part{i+1}')])
+
+        self.logger.debug(f"✅ 文档结构验证通过: {len(report_guide)} 个部分（支持递归subsections）")
 
     def add_writing_guides(self, structure: Dict[str, Any], user_description: str) -> Dict[str, Any]:
         """
@@ -742,7 +759,7 @@ class EnhancedOrchestratorAgent:
         print(f"📊 即将并行处理 {total_sections} 个大章节，并发线程数：{self.max_workers}")
         print(f"🔄 开始并行处理...")
         
-        # 使用线程池并行处理各个大章节
+        # 使用线程池并行处理各个大章节（入口），内部对子树递归处理
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
             # 提交所有章节处理任务
             future_to_section = {}
@@ -813,13 +830,13 @@ class EnhancedOrchestratorAgent:
         self.logger.info(start_msg)
         print(start_msg)  # 同时输出到控制台
         
-        # 构建包含所有子章节的提示词
+        # 构建包含直系子章节的提示词
         subtitles_list = []
         for i, subsection in enumerate(subsections):
             subtitles_list.append(f"{i+1}. {subsection.get('subtitle', '')}")
-        
+
         subtitles_text = "\n".join(subtitles_list)
-        
+
         prompt = f"""
 你是一个专业文档写作指导专家。
 
@@ -874,7 +891,7 @@ class EnhancedOrchestratorAgent:
                 response = self.llm_client.generate(prompt)
                 guides_data = json.loads(response.strip())
                 
-                # 将生成的写作指导应用到原始结构中
+                # 将生成的写作指导应用到原始结构中（仅直系子节点）
                 guides_dict = {}
                 for guide in guides_data.get('writing_guides', []):
                     guides_dict[guide.get('subtitle', '')] = guide.get('how_to_write', '')
@@ -893,6 +910,22 @@ class EnhancedOrchestratorAgent:
                 success_msg = f"✅ [线程{section_num}] 成功生成 {updated_count}/{len(subsections)} 个子章节的写作指导"
                 self.logger.info(success_msg)
                 print(success_msg)
+                # 递归处理每个子节点的subsections
+                for idx, subsection in enumerate(section.get('sections', [])):
+                    if subsection.get('subsections'):
+                        # 为该子节点构造一个“虚拟部分”，其直系子节点是该子节点的subsections
+                        virtual_section = {
+                            'title': subsection.get('subtitle', ''),
+                            'goal': f"子章节'{subsection.get('subtitle','')}'的写作目标",
+                            'sections': subsection.get('subsections', [])
+                        }
+                        # 递归生成how_to_write
+                        processed_virtual = self._process_section_writing_guides(
+                            virtual_section, user_description, section_num, total_sections
+                        )
+                        # 将生成的how_to_write回填到原subsections
+                        subsection['subsections'] = processed_virtual.get('sections', subsection.get('subsections', []))
+
                 return section
                 
             except json.JSONDecodeError as e:
@@ -994,20 +1027,34 @@ class EnhancedOrchestratorAgent:
             bool: 是否包含完整的写作指导
         """
         report_guide = template.get('report_guide', [])
-        total_sections = 0
-        sections_with_guides = 0
-        
+        total_leaves = 0
+        leaves_with_guides = 0
+
+        def _walk(nodes: List[Dict[str, Any]]):
+            nonlocal total_leaves, leaves_with_guides
+            if not isinstance(nodes, list):
+                return
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                subtitle = node.get('subtitle')
+                subs = node.get('subsections', [])
+                has_children = isinstance(subs, list) and len(subs) > 0
+                if subtitle and not has_children:
+                    total_leaves += 1
+                    guide = node.get('how_to_write', '')
+                    if isinstance(guide, str) and guide.strip():
+                        leaves_with_guides += 1
+                if has_children:
+                    _walk(subs)
+
         for part in report_guide:
-            sections = part.get('sections', [])
-            for section in sections:
-                total_sections += 1
-                if 'how_to_write' in section and section['how_to_write'].strip():
-                    sections_with_guides += 1
+            _walk(part.get('sections', []))
+
+        completion_rate = leaves_with_guides / total_leaves if total_leaves > 0 else 0
+        self.logger.info(f"📊 模板写作指导完整度(叶子节点): {completion_rate*100:.1f}% ({leaves_with_guides}/{total_leaves})")
         
-        completion_rate = sections_with_guides / total_sections if total_sections > 0 else 0
-        self.logger.info(f"📊 模板写作指导完整度: {completion_rate*100:.1f}% ({sections_with_guides}/{total_sections})")
-        
-        return sections_with_guides == total_sections
+        return total_leaves > 0 and leaves_with_guides == total_leaves
 
     def generate_complete_guide(self, user_description: str) -> Dict[str, Any]:
         """

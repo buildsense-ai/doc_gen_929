@@ -140,21 +140,32 @@ class EnhancedMainDocumentGenerator:
         
         updated_json = json.loads(json.dumps(json_data))
         tasks = []
-        
-        # 构建任务列表
-        for title_idx, title_part in enumerate(updated_json.get('report_guide', [])):
-            for section_idx, section in enumerate(title_part.get('sections', [])):
-                if 'subtitle' in section:
-                    task = {
+
+        # 递归收集所有叶子节点任务（无子节点或子节点为空）
+        def collect_leaf_tasks(title_idx: int, nodes: List[Dict[str, Any]], path_prefix: List[int]) -> None:
+            if not isinstance(nodes, list):
+                return
+            for idx, node in enumerate(nodes):
+                if not isinstance(node, dict):
+                    continue
+                subsections = node.get('subsections', [])
+                has_children = isinstance(subsections, list) and len(subsections) > 0
+                current_path = path_prefix + [idx]
+                if not has_children and 'subtitle' in node:
+                    tasks.append({
                         'title_idx': title_idx,
-                        'section_idx': section_idx,
-                        'subtitle': section['subtitle'],
-                        'how_to_write': section.get('how_to_write', ''),
-                        'retrieved_text': section.get('retrieved_text', []),
-                        'retrieved_image': section.get('retrieved_image', []),
-                        'retrieved_table': section.get('retrieved_table', [])
-                    }
-                tasks.append(task)
+                        'path': current_path,  # 从sections开始的索引路径
+                        'subtitle': node.get('subtitle', ''),
+                        'how_to_write': node.get('how_to_write', ''),
+                        'retrieved_text': node.get('retrieved_text', []),
+                        'retrieved_image': node.get('retrieved_image', []),
+                        'retrieved_table': node.get('retrieved_table', [])
+                    })
+                else:
+                    collect_leaf_tasks(title_idx, subsections or [], current_path)
+
+        for title_idx, title_part in enumerate(updated_json.get('report_guide', [])):
+            collect_leaf_tasks(title_idx, title_part.get('sections', []), [])
         
         total_tasks = len(tasks)
         completed_tasks = 0
@@ -176,15 +187,21 @@ class EnhancedMainDocumentGenerator:
                 try:
                     result = future.result()
                     
-                    # 更新JSON
+                    # 更新JSON（根据路径定位叶子节点）
                     title_idx = task['title_idx']
-                    section_idx = task['section_idx']
-                    section = updated_json['report_guide'][title_idx]['sections'][section_idx]
-                    
-                    section['generated_content'] = result['content']
-                    section['quality_score'] = result['quality_score']
-                    section['word_count'] = result['word_count']
-                    section['generation_time'] = result['generation_time']
+                    path = task['path']
+                    node_cursor = updated_json['report_guide'][title_idx].get('sections', [])
+                    target_node = None
+                    for depth, idx in enumerate(path):
+                        if depth == len(path) - 1:
+                            target_node = node_cursor[idx]
+                        else:
+                            node_cursor = node_cursor[idx].get('subsections', [])
+                    if isinstance(target_node, dict):
+                        target_node['generated_content'] = result['content']
+                        target_node['quality_score'] = result['quality_score']
+                        target_node['word_count'] = result['word_count']
+                        target_node['generation_time'] = result['generation_time']
                     
                     completed_tasks += 1
                     self.generation_stats['completed_sections'] = completed_tasks
@@ -395,38 +412,42 @@ class EnhancedMainDocumentGenerator:
         
         markdown_lines = []
         report_guide = json_data.get('report_guide', [])
-        
+
+        def render_node(node: Dict[str, Any], level: int) -> None:
+            subtitle = node.get('subtitle', '')
+            header_level = min(max(level, 2), 6)
+            markdown_lines.append(f"{'#' * header_level} {subtitle}")
+            markdown_lines.append("")
+
+            generated_content = node.get('generated_content', '')
+            retrieved_table = node.get('retrieved_table', [])
+            retrieved_image = node.get('retrieved_image', [])
+            children = node.get('subsections', []) or []
+
+            if generated_content:
+                content = self._format_content(generated_content)
+                content_with_media = self._append_tables_and_images(content, retrieved_table, retrieved_image)
+                markdown_lines.append(content_with_media)
+                markdown_lines.append("")
+            else:
+                # 仅在叶子节点缺少正文时显示占位符；非叶子节点跳过占位符
+                if not children:
+                    markdown_lines.append("*[内容未生成]*")
+                    markdown_lines.append("")
+
+            for child in children:
+                render_node(child, level + 1)
+
         for title_section in report_guide:
             title = title_section.get('title', '')
             sections = title_section.get('sections', [])
-            
-            # 添加主标题（一级标题）
+
             markdown_lines.append(f"# {title}")
             markdown_lines.append("")
-            
-            # 处理每个子节
+
             for section in sections:
-                subtitle = section.get('subtitle', '')
-                generated_content = section.get('generated_content', '')
-                retrieved_table = section.get('retrieved_table', [])
-                retrieved_image = section.get('retrieved_image', [])
-                
-                # 添加子标题（二级标题）
-                markdown_lines.append(f"## {subtitle}")
-                markdown_lines.append("")
-                
-                # 添加生成的内容（只有正文，不包含标题）
-                if generated_content:
-                    # 对正文内容进行缩进处理
-                    content = self._format_content(generated_content)
-                    # 添加表格和图片
-                    content_with_media = self._append_tables_and_images(content, retrieved_table, retrieved_image)
-                    markdown_lines.append(content_with_media)
-                else:
-                    markdown_lines.append("*[内容未生成]*")
-                
-                markdown_lines.append("")
-        
+                render_node(section, 2)
+
         return "\n".join(markdown_lines)
     
     def _format_content(self, content: str) -> str:
@@ -498,26 +519,34 @@ class EnhancedMainDocumentGenerator:
         """获取统计信息"""
         
         stats = {
-            'total_sections': 0,
-            'completed_sections': 0,
+            'total_sections': 0,  # 统计叶子节点
+            'completed_sections': 0,  # 完成的叶子节点
             'total_words': 0,
             'average_quality': 0.0
         }
         
         report_guide = json_data.get('report_guide', [])
         quality_scores = []
-        
+
+        def accumulate_leaf_stats(nodes: List[Dict[str, Any]]):
+            if not isinstance(nodes, list):
+                return
+            for node in nodes:
+                if not isinstance(node, dict):
+                    continue
+                subs = node.get('subsections', [])
+                has_children = isinstance(subs, list) and len(subs) > 0
+                if not has_children and node.get('subtitle'):
+                    stats['total_sections'] += 1
+                    if 'generated_content' in node:
+                        stats['completed_sections'] += 1
+                        stats['total_words'] += node.get('word_count', 0)
+                        quality_scores.append(node.get('quality_score', 0.0))
+                if has_children:
+                    accumulate_leaf_stats(subs)
+
         for title_section in report_guide:
-            sections = title_section.get('sections', [])
-            stats['total_sections'] += len(sections)
-            
-            for section in sections:
-                if 'generated_content' in section:
-                    stats['completed_sections'] += 1
-                    stats['total_words'] += section.get('word_count', 0)
-                    
-                    quality_score = section.get('quality_score', 0.0)
-                    quality_scores.append(quality_score)
+            accumulate_leaf_stats(title_section.get('sections', []))
         
         if quality_scores:
             stats['average_quality'] = sum(quality_scores) / len(quality_scores)

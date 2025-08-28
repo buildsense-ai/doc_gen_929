@@ -1,0 +1,77 @@
+{
+  "report_guide": [
+    {
+      "goal": "阐明文档的编写目的、项目背景，为后续内容提供宏观指引，确保读者从一开始就理解文档的核心价值与定位。",
+      "title": "一、引言",
+      "sections": [
+        {
+          "subtitle": "1.1、编写目的",
+          "subsections": []
+        },
+        {
+          "subtitle": "1.2、项目背景",
+          "subsections": []
+        }
+      ]
+    },
+    {
+      "goal": "全面介绍系统的核心功能、性能表现及安全保障措施，让用户对系统的实用性、可靠性和安全性建立清晰而全面的认识。",
+      "title": "二、用途",
+      "sections": [
+        {
+          "subtitle": "2.1、功能",
+          "subsections": []
+        },
+        {
+          "subtitle": "2.2、性能",
+          "subsections": []
+        },
+        {
+          "subtitle": "2.3、安全保密",
+          "subsections": []
+        }
+      ]
+    },
+    {
+      "goal": "清晰、准确地告知用户运行本系统所需的硬件设备规格和软件环境要求，帮助用户在部署和使用前进行环境自检。",
+      "title": "三、运行环境",
+      "sections": [
+        {
+          "subtitle": "3.1、硬件设备",
+          "subsections": []
+        },
+        {
+          "subtitle": "3.2、支持软件",
+          "subsections": []
+        }
+      ]
+    },
+    {
+      "goal": "提供详尽的操作指南，从首次接触的注册登录，到各个核心功能的具体使用方法，确保用户能够独立、顺畅地完成所有操作。",
+      "title": "四、使用过程",
+      "sections": [
+        {
+          "subtitle": "4.1、水表系统主要使用对象说明及操作逻辑",
+          "subsections": []
+        },
+        {
+          "subtitle": "4.2、系统页面",
+          "subsections": []
+        },
+        {
+          "subtitle": "4.2.2、水表识别页面和操作说明",
+          "subsections": []
+        },
+        {
+          "subtitle": "4.2.3、水量预测页面和操作说明",
+          "subsections": []
+        },
+        {
+          "subtitle": "4.2.4、智能水表客服页面和操作说明",
+          "subsections": []
+        }
+      ]
+    }
+  ],
+  "template_id": "3272cac2-d0b4-4444-b99a-e2dd2f1c657f"
+}
