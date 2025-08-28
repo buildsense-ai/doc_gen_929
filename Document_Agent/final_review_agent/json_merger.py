@@ -9,7 +9,7 @@ import json
 import os
 import sys
 from datetime import datetime
-from typing import Dict, Any
+from typing import Dict, Any, List, Optional, Tuple
 
 # 添加路径以导入main_generator
 sys.path.append(os.path.join(os.path.dirname(__file__), '..', 'content_generator_agent'))
