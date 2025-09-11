@@ -38,7 +38,7 @@ def main():
     print("🤖 ReAct Agent - JSON报告指南处理器 (内部并行版)")
     print("=" * 60)
     
-    input_file = "E:\\项目代码\\Gauz文档Agent\\第一agent的输出.json"
+    input_file = r"E:\项目代码\Gauz文档Agent_8_10\api_outputs\d6952522-b18d-49b1-9ec9-a9c368126cb9_20250911_151714\step1_document_guide_20250911_151714.json"
     
     if not os.path.exists(input_file):
         print(f"❌ 输入文件不存在: {input_file}")
@@ -57,7 +57,8 @@ def main():
         start_time = datetime.now()
         
         # --- 调用非常简单 ---
-        result_data = agent.process_report_guide(input_data)
+        project_name = "清远市清新区中等职业教育基地"
+        result_data = agent.process_report_guide(input_data, project_name)
         
         processing_time = (datetime.now() - start_time).total_seconds()
         print(f"\n⏱️ 所有章节处理完成，总耗时: {processing_time:.2f}秒")

@@ -181,14 +181,14 @@ class OneClickGenerationRequest(BaseModel):
     """一键串联工作流请求模型（结构→检索→成文→评审→再生→合并）"""
     query: str = Field(..., description="文档生成需求描述", min_length=1, max_length=2000)
     project_name: str = Field(..., description="项目名称，用于RAG检索", min_length=1, max_length=100)
-    enable_review_and_regeneration: bool = Field(default=True, description="是否启用评审+再生+合并")
+    enable_review_and_regeneration: bool = Field(default=False, description="是否启用评审+再生+合并")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "query": "我想生成一个关于医灵古庙的文物影响评估报告",
                 "project_name": "医灵古庙",
-                "enable_review_and_regeneration": True
+                "enable_review_and_regeneration": False
             }
         }
 

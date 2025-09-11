@@ -1,0 +1,23 @@
+{
+  "report_guide": [
+    {
+      "title": "一、市场分析",
+      "sections": [
+        {
+          "subtitle": "1.1、2025年第一季度经济形势",
+          "how_to_write": "分析2025年第一季度的宏观经济形势，包括GDP增长、通胀水平、就业状况等关键指标。重点关注政策变化对经济的影响，以及各行业的发展趋势。需要提供具体的数据支撑和权威分析。",
+          "retrieved_text": [],
+          "retrieved_image": [],
+          "retrieved_table": []
+        },
+        {
+          "subtitle": "1.2、人工智能行业发展现状",
+          "how_to_write": "深入分析人工智能行业在2025年的最新发展动态，包括技术突破、市场规模、主要玩家、投资情况等。重点关注ChatGPT、Claude等大语言模型的发展，以及AI在各个垂直领域的应用情况。",
+          "retrieved_text": [],
+          "retrieved_image": [],
+          "retrieved_table": []
+        }
+      ]
+    }
+  ]
+}

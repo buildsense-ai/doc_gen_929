@@ -1,0 +1,12 @@
+2025-09-04 17:42:53,068 - common.advanced_rate_limiter.orchestrator_agent - INFO - 文档生成智能速率控制器初始化: orchestrator_agent, base_delay=0.8s
+2025-09-04 17:42:53,069 - common.advanced_rate_limiter.react_agent - INFO - 文档生成智能速率控制器初始化: react_agent, base_delay=1.0s
+2025-09-04 17:42:53,069 - common.advanced_rate_limiter.content_generator_agent - INFO - 文档生成智能速率控制器初始化: content_generator_agent, base_delay=1.2s
+2025-09-04 17:42:53,069 - clients.external_api_client.ExternalAPIClient - INFO - 🔄 已跳过健康检查，假设所有服务可用
+2025-09-04 17:42:53,069 - clients.external_api_client.ExternalAPIClient - INFO - ExternalAPIClient 初始化完成
+2025-09-04 17:42:53,079 - clients.external_api_client.ExternalAPIClient - INFO - 模板搜索服务: http://43.139.19.144:8003 - 可用
+2025-09-04 17:42:53,080 - clients.external_api_client.ExternalAPIClient - INFO - RAG检索服务: http://43.139.19.144:8001 - 可用
+2025-09-04 17:42:53,080 - Document_Agent.section_writer_agent.react_agent - INFO - EnhancedReactAgent 初始化完成，并发线程数: 12, 智能速率控制: 已启用
+2025-09-04 17:42:53,080 - Document_Agent.section_writer_agent.react_agent - INFO - ✅ 外部API服务连接正常: 外部API客户端 v3.0.0-api
+2025-09-04 17:42:53,080 - clients.web_search_client - INFO - 🌐 Web搜索: test (引擎: ['serp'])
+2025-09-04 17:43:00,483 - clients.web_search_client - INFO - ✅ Web搜索成功: 获得 9 条结果, 耗时 7.40s
+2025-09-04 17:43:00,483 - Document_Agent.section_writer_agent.react_agent - INFO - ✅ Web搜索服务连接正常: Web Search API

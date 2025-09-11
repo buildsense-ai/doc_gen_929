@@ -159,7 +159,8 @@ class EnhancedMainDocumentGenerator:
                         'how_to_write': node.get('how_to_write', ''),
                         'retrieved_text': node.get('retrieved_text', []),
                         'retrieved_image': node.get('retrieved_image', []),
-                        'retrieved_table': node.get('retrieved_table', [])
+                        'retrieved_table': node.get('retrieved_table', []),
+                        'retrieved_web': node.get('retrieved_web', [])
                     })
                 else:
                     collect_leaf_tasks(title_idx, subsections or [], current_path)
@@ -267,7 +268,8 @@ class EnhancedMainDocumentGenerator:
                 task['how_to_write'],
                 task['retrieved_text'],
                 task['retrieved_image'],
-                task['retrieved_table']
+                task['retrieved_table'],
+                task['retrieved_web']
             )
             generation_time = time.time() - generation_start
             

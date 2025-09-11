@@ -20,6 +20,7 @@ import concurrent.futures
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 # 移除SimpleRAGClient导入
 from clients.external_api_client import get_external_api_client
+from clients.web_search_client import get_web_search_client
 from config.settings import get_concurrency_manager, SmartConcurrencyManager
 
 # ==============================================================================
@@ -80,6 +81,9 @@ class EnhancedReactAgent:
         # 外部API客户端
         self.external_api = get_external_api_client()
         
+        # Web搜索客户端
+        self.web_search_client = get_web_search_client()
+        
         # 智能并发管理器
         self.concurrency_manager = concurrency_manager or get_concurrency_manager()
         self.max_workers = self.concurrency_manager.get_max_workers('react_agent')
@@ -118,6 +122,16 @@ class EnhancedReactAgent:
                 self.colored_logger.warning(f"⚠️ 外部API服务状态异常: {api_status}，将使用本地RAG作为备用")
         except Exception as e:
             self.colored_logger.error(f"❌ 外部API服务连接检查失败: {e}，将使用本地RAG作为备用")
+        
+        # 检查Web搜索服务状态
+        try:
+            web_status = self.web_search_client.check_service_status()
+            if web_status.get('status') == 'running':
+                self.colored_logger.info(f"✅ Web搜索服务连接正常: {web_status.get('service', '')}")
+            else:
+                self.colored_logger.warning(f"⚠️ Web搜索服务状态异常: {web_status}")
+        except Exception as e:
+            self.colored_logger.error(f"❌ Web搜索服务连接检查失败: {e}")
 
     def set_max_workers(self, max_workers: int):
         """动态设置最大线程数"""
@@ -166,6 +180,9 @@ class EnhancedReactAgent:
             node['retrieved_text'] = result['retrieved_text']
             node['retrieved_image'] = result['retrieved_image']
             node['retrieved_table'] = result['retrieved_table']
+            # 添加Web搜索结果处理
+            if 'retrieved_web' in result:
+                node['retrieved_web'] = result['retrieved_web']
         else:
             node['retrieved_data'] = result
 
@@ -187,30 +204,452 @@ class EnhancedReactAgent:
         return retrieved_content
 
     def _react_loop_for_section(self, section_context: Dict[str, str], state: ReActState) -> str:
-        """ReAct的核心循环 - 分段搜索模式，每个subtitle只搜索一次"""
-        # 分段搜索模式：每个subtitle只进行一次搜索
+        """ReAct的核心循环 - 多维度并行查询模式"""
         state.iteration = 1
-        self.colored_logger.iteration(state.iteration, 1)  # 显示1/1
+        self.colored_logger.iteration(state.iteration, 1)
         
-        action_plan = self._reason_and_act_for_section(section_context, state)
-        if not action_plan or not action_plan.get('keywords'):
-            self.colored_logger.thought("未能生成有效的行动计划，提前结束。")
+        # 生成多维度查询计划
+        multi_queries = self._generate_multi_dimensional_queries(section_context, state)
+        if not multi_queries:
+            self.colored_logger.thought("未能生成有效的多维度查询计划，提前结束。")
             return self._synthesize_retrieved_results(section_context, state)
 
-        reasoning, query, strategy = (action_plan.get('analysis'), action_plan.get('keywords'), action_plan.get('strategy'))
-        state.attempted_queries.append(f"{strategy}:{query}")
-        self.colored_logger.thought(reasoning)
-        self.colored_logger.input_tool(f"外部API搜索 | Strategy: {strategy} | Query: {query}")
+        self.colored_logger.thought(f"生成了 {len(multi_queries)} 个维度的查询计划")
         
-        results, quality_score = self._observe_section_results(query, section_context, state)
-        state.retrieved_results.extend(results)
-        state.quality_scores.append(quality_score)
-        self.colored_logger.observation(f"检索到 {len(results)} 条结果, 评估质量分: {quality_score:.2f}")
+        # 并行执行多个RAG查询
+        all_results = []
         
-        # 分段搜索模式：不进行质量反思，直接返回结果
-        self.colored_logger.reflection(f"分段搜索模式：单次搜索完成，质量分: {quality_score:.2f}")
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(multi_queries), 2)) as executor:
+            future_to_query = {
+                executor.submit(self._execute_single_query, query_info, section_context, state): query_info
+                for query_info in multi_queries
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_query):
+                query_info = future_to_query[future]
+                try:
+                    results = future.result()
+                    all_results.extend(results)
+                    self.colored_logger.observation(f"维度'{query_info['dimension']}'检索完成: {len(results)}条结果")
+                except Exception as exc:
+                    self.colored_logger.error(f"维度'{query_info['dimension']}'查询失败: {exc}")
+        
+        # 合并所有RAG结果
+        state.retrieved_results.extend(all_results)
+        
+        self.colored_logger.reflection(f"RAG多维度查询完成: 总计{len(all_results)}条结果")
+        
+        # 必定执行Web搜索补充：分析RAG结果缺口后进行针对性Web搜索
+        self.colored_logger.thought(f"🤔 分析RAG检索结果，识别信息缺口...")
+        web_results = self._perform_intelligent_web_search(section_context, all_results)
+        if web_results:
+            all_results.extend(web_results)
+            state.retrieved_results.extend(web_results)
+            self.colored_logger.observation(f"🌐 智能Web搜索补充: 新增 {len(web_results)} 条结果")
+        else:
+            self.colored_logger.warning("🌐 Web搜索未返回结果")
                 
         return self._synthesize_retrieved_results(section_context, state)
+
+    def _generate_multi_dimensional_queries(self, section_context: Dict[str, str], state: ReActState) -> List[Dict[str, str]]:
+        """生成多维度查询计划"""
+        # 获取项目名称，用于生成更精准的查询
+        project_name = getattr(self, 'current_project_name', '')
+        
+        prompt = f"""
+你是专业的报告编制专家，需要为特定项目的报告章节制定精准的资料检索计划。
+
+【项目信息】: {project_name}
+【目标章节】: {section_context['subtitle']}
+【写作要求】: {section_context['how_to_write']}
+
+【核心任务】: 深度分析写作要求，识别完成该章节写作的必备资料类型，生成精准的检索查询。
+
+【分析步骤】:
+1. 从写作要求中提取关键信息要素（数据、政策、标准、案例等）
+2. 结合项目特点确定检索的业务领域和范围
+3. 针对每类必备资料设计最有效的检索词组
+
+【查询生成原则】:
+1. 【紧扣写作要求】: 查询必须直接服务于写作要求中的具体内容
+2. 【项目特定性】: 结合项目名称中的关键信息（行业、地域、类型）
+3. 【资料导向】: 重点检索能直接用于写作的具体资料
+4. 【精准简洁】: 每个查询2-4个核心关键词，避免宽泛概念
+
+【输出要求】: 严格返回JSON数组，包含2-3个最关键的检索维度:
+[
+  {{"dimension": "资料类型描述", "query": "精准查询词组", "priority": "high/medium/low"}},
+  {{"dimension": "资料类型描述", "query": "精准查询词组", "priority": "high/medium/low"}}
+]
+
+【示例参考】:
+- 政策类资料: "职业教育法 实施细则" 
+- 标准类资料: "中职学校 建设标准"
+- 数据类资料: "清远市 教育统计"
+- 案例类资料: "职业教育基地 建设案例"
+"""
+        
+        try:
+            response_str = self.client.generate(prompt)
+            # 提取JSON数组
+            import re
+            json_match = re.search(r'\[.*?\]', response_str, re.DOTALL)
+            if json_match:
+                queries = json.loads(json_match.group(0))
+                # 验证格式
+                valid_queries = []
+                for q in queries:
+                    if isinstance(q, dict) and all(k in q for k in ['dimension', 'query', 'priority']):
+                        valid_queries.append(q)
+                
+                self.colored_logger.debug(f"🎯 生成多维度查询: {[q['dimension'] for q in valid_queries]}")
+                return valid_queries
+            else:
+                self.colored_logger.error("未能从LLM响应中提取有效的JSON数组")
+                return []
+        except Exception as e:
+            self.colored_logger.error(f"生成多维度查询失败: {e}")
+            return []
+
+    def _execute_single_query(self, query_info: Dict[str, str], section_context: Dict[str, str], state: ReActState) -> List[Dict]:
+        """执行单个维度的查询"""
+        query = query_info['query']
+        dimension = query_info['dimension']
+        
+        self.colored_logger.input_tool(f"🔍 {dimension} | Query: {query}")
+        
+        # 记录查询尝试
+        state.attempted_queries.append(f"{dimension}:{query}")
+        
+        # 执行查询
+        results = self._observe_section_results(query, section_context, state)
+        
+        # 为结果添加维度标记
+        for result in results:
+            result['dimension'] = dimension
+            result['priority'] = query_info.get('priority', 'medium')
+        
+        return results
+
+    def _perform_intelligent_web_search(self, section_context: Dict[str, str], rag_results: List[Dict]) -> List[Dict[str, Any]]:
+        """基于RAG结果分析进行智能Web搜索"""
+        try:
+            # 分析RAG结果的内容缺口
+            web_query = self._analyze_rag_gaps_and_generate_query(section_context, rag_results)
+            if not web_query:
+                self.colored_logger.warning("❌ 未能生成Web搜索查询，跳过Web搜索补充")
+                return []
+            
+            self.colored_logger.input_tool(f"🌐 智能Web搜索 | Query: {web_query}")
+            
+            # 执行Web搜索
+            search_results = self.web_search_client.search(
+                query=web_query,
+                engines=["serp"],
+                max_results=5
+            )
+            
+            if not search_results:
+                self.colored_logger.warning("🌐 Web搜索未返回结果")
+                return []
+            
+            # 格式化Web搜索结果
+            formatted_results = self.web_search_client.format_search_results(search_results)
+            
+            # 为Web搜索结果添加标记
+            for result in formatted_results:
+                result['dimension'] = 'web_intelligent'
+                result['priority'] = 'medium'  # Web搜索作为补充，优先级中等
+                result['type'] = 'web_text'
+            
+            return formatted_results
+            
+        except Exception as e:
+            self.colored_logger.error(f"❌ 智能Web搜索失败: {e}")
+            return []
+
+    def _analyze_rag_gaps_and_generate_query(self, section_context: Dict[str, str], rag_results: List[Dict]) -> Optional[str]:
+        """分析RAG结果缺口并生成Web搜索查询"""
+        
+        # 安全地处理RAG结果内容
+        def safe_content_summary(results):
+            if not results:
+                return "无检索结果"
+            
+            content_snippets = []
+            for result in results[:3]:  # 只分析前3个结果
+                content = result.get('content', '')
+                if isinstance(content, str) and content.strip():
+                    content_snippets.append(content[:80])  # 取前80字符
+            
+            return " | ".join(content_snippets) if content_snippets else "检索结果为空"
+        
+        rag_summary = safe_content_summary(rag_results)
+        
+        # 获取项目名称，用于生成更精准的查询
+        project_name = getattr(self, 'current_project_name', '')
+        
+        prompt = f"""
+你是专业的报告编制专家，需要为当前报告章节生成精准的Web搜索查询。
+
+【项目名称】: {project_name}
+【目标章节】: {section_context['subtitle']}
+【写作要求】: {section_context['how_to_write']}
+【RAG已有内容】: {rag_summary}
+
+【核心任务】: 基于RAG检索结果的不足，生成1个精准的Web搜索查询来补充关键信息
+
+【查询生成原则】:
+1. 【主题聚焦】: 紧扣项目名称和章节主题，提取核心业务领域关键词
+2. 【内容互补】: 重点补充RAG缺失的信息（政策法规、标准规范、案例参考、最新数据）
+3. 【精准简洁】: 查询词控制在3-6个核心词汇，避免冗长拼接
+4. 【时效优先】: 优先获取最新的行业信息和政策动态
+
+【输出要求】: 
+- 只返回搜索查询词，用空格分隔
+- 长度限制：3-6个关键词
+- 必须贴合项目主题和章节内容
+- 不要任何解释或其他内容
+
+【查询构建逻辑】:
+1. 从项目名称中提取行业/领域关键词
+2. 结合章节要求确定信息类型（政策/标准/数据/案例）
+3. 生成简洁有效的搜索词组合
+"""
+        
+        try:
+            response = self.client.generate(prompt)
+            # 提取并清理查询词
+            web_query = response.strip().replace('\n', ' ').replace('\r', ' ')
+            web_query = ' '.join(web_query.split())  # 移除多余空格
+            
+            # 移除可能的引号和其他标点符号
+            web_query = web_query.replace('"', '').replace("'", '').replace('，', ' ').replace('、', ' ')
+            web_query = ' '.join(web_query.split())  # 再次清理空格
+            
+            # 限制查询词数量（3-6个词）
+            query_words = web_query.split()
+            if len(query_words) > 6:
+                web_query = ' '.join(query_words[:6])
+            
+            # 确保查询长度合理
+            if len(web_query) > 50:
+                web_query = web_query[:50].rsplit(' ', 1)[0]
+            
+            if web_query and len(web_query.split()) >= 2:
+                self.colored_logger.debug(f"🎯 智能生成Web查询: {web_query}")
+                return web_query
+            else:
+                self.colored_logger.warning(f"LLM生成的查询不符合要求: '{response}' -> '{web_query}'，跳过Web搜索")
+                return None
+                
+        except Exception as e:
+            self.colored_logger.error(f"分析RAG缺口失败: {e}，跳过Web搜索")
+            return None
+
+    def _perform_web_search_supplement(self, section_context: Dict[str, str], multi_queries: List[Dict[str, str]]) -> List[Dict[str, Any]]:
+        """执行Web搜索补充"""
+        try:
+            # 生成Web搜索查询
+            web_query = self._generate_web_search_query(section_context, multi_queries)
+            if not web_query:
+                return []
+            
+            self.colored_logger.input_tool(f"🌐 Web搜索补充 | Query: {web_query}")
+            
+            # 执行Web搜索
+            search_results = self.web_search_client.search(
+                query=web_query,
+                engines=["serp"],
+                max_results=5  # 限制Web搜索结果数量
+            )
+            
+            if not search_results:
+                self.colored_logger.warning("🌐 Web搜索未返回结果")
+                return []
+            
+            # 格式化Web搜索结果
+            formatted_results = self.web_search_client.format_search_results(search_results)
+            
+            # 为Web搜索结果添加维度标记
+            for result in formatted_results:
+                result['dimension'] = 'web_supplement'
+                result['priority'] = 'medium'  # Web搜索结果作为补充，优先级中等
+            
+            return formatted_results
+            
+        except Exception as e:
+            self.colored_logger.error(f"❌ Web搜索补充失败: {e}")
+            return []
+    
+    def _generate_web_search_query(self, section_context: Dict[str, str], multi_queries: List[Dict[str, str]]) -> Optional[str]:
+        """生成Web搜索查询词"""
+        try:
+            # 提取章节标题的关键信息
+            subtitle = section_context.get('subtitle', '')
+            
+            # 构建Web搜索查询
+            # 优先使用最重要的维度查询
+            primary_queries = [q['query'] for q in multi_queries if q.get('priority') == 'high']
+            if not primary_queries:
+                primary_queries = [q['query'] for q in multi_queries[:1]]  # 取第一个查询
+            
+            if primary_queries:
+                # 结合章节标题和主要查询构建Web搜索词
+                web_query = f"{primary_queries[0]} {subtitle}".strip()
+                # 清理查询词，移除特殊字符
+                web_query = ' '.join(web_query.split())
+                return web_query[:100]  # 限制查询长度
+            
+            return None
+            
+        except Exception as e:
+            self.colored_logger.error(f"❌ 生成Web搜索查询失败: {e}")
+            return None
+
+    def _deduplicate_results(self, results: List[Dict], result_type: str) -> List[Dict]:
+        """智能去重处理"""
+        if not results:
+            return results
+        
+        # 根据不同类型采用不同的去重策略
+        if result_type == 'text':
+            return self._deduplicate_text_results(results)
+        elif result_type == 'image':
+            return self._deduplicate_image_results(results)
+        elif result_type == 'table':
+            return self._deduplicate_table_results(results)
+        elif result_type == 'web_text':
+            return self._deduplicate_web_results(results)
+        else:
+            return results
+    
+    def _deduplicate_text_results(self, results: List[Dict]) -> List[Dict]:
+        """文本结果去重：基于内容相似度和页码"""
+        if len(results) <= 1:
+            return results
+        
+        deduplicated = []
+        seen_pages = set()
+        seen_content_hashes = set()
+        
+        # 按质量分数排序，优先保留高质量结果
+        sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+        
+        for result in sorted_results:
+            page_num = result.get('page_number', '')
+            content = result.get('content', '')
+            
+            # 生成内容hash用于去重
+            content_hash = hash(content[:200])  # 使用前200字符生成hash
+            
+            # 去重逻辑：
+            # 1. 相同页码的内容只保留一个（质量最高的）
+            # 2. 内容高度相似的只保留一个
+            if page_num not in seen_pages and content_hash not in seen_content_hashes:
+                deduplicated.append(result)
+                if page_num:
+                    seen_pages.add(page_num)
+                seen_content_hashes.add(content_hash)
+                
+                # 限制每种类型的最大结果数
+                if len(deduplicated) >= 8:  # 文本结果最多保留8条
+                    break
+        
+        self.colored_logger.debug(f"📝 文本去重: {len(results)} -> {len(deduplicated)}")
+        return deduplicated
+    
+    def _deduplicate_image_results(self, results: List[Dict]) -> List[Dict]:
+        """图片结果去重：基于路径和页码"""
+        if len(results) <= 1:
+            return results
+        
+        deduplicated = []
+        seen_paths = set()
+        seen_pages = set()
+        
+        # 按质量分数排序
+        sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+        
+        for result in sorted_results:
+            path = result.get('path', '')
+            page_num = result.get('page_number', '')
+            
+            # 图片去重：相同路径或相同页码的图片只保留一个
+            path_key = path.strip() if path else f"page_{page_num}"
+            
+            if path_key not in seen_paths:
+                deduplicated.append(result)
+                seen_paths.add(path_key)
+                
+                # 限制图片结果数量
+                if len(deduplicated) >= 6:  # 图片结果最多保留6条
+                    break
+        
+        self.colored_logger.debug(f"🖼️ 图片去重: {len(results)} -> {len(deduplicated)}")
+        return deduplicated
+    
+    def _deduplicate_table_results(self, results: List[Dict]) -> List[Dict]:
+        """表格结果去重：基于页码和内容"""
+        if len(results) <= 1:
+            return results
+        
+        deduplicated = []
+        seen_pages = set()
+        
+        # 按质量分数排序
+        sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+        
+        for result in sorted_results:
+            page_num = result.get('page_number', '')
+            
+            # 表格去重：相同页码的表格只保留一个
+            if page_num not in seen_pages:
+                deduplicated.append(result)
+                if page_num:
+                    seen_pages.add(page_num)
+                
+                # 限制表格结果数量
+                if len(deduplicated) >= 4:  # 表格结果最多保留4条
+                    break
+        
+        self.colored_logger.debug(f"📋 表格去重: {len(results)} -> {len(deduplicated)}")
+        return deduplicated
+    
+    def _deduplicate_web_results(self, results: List[Dict]) -> List[Dict]:
+        """Web搜索结果去重：基于URL和内容相似度"""
+        if len(results) <= 1:
+            return results
+        
+        deduplicated = []
+        seen_urls = set()
+        seen_content_hashes = set()
+        
+        # 按质量分数排序
+        sorted_results = sorted(results, key=lambda x: x.get('score', 0), reverse=True)
+        
+        for result in sorted_results:
+            url = result.get('url', '')
+            content = result.get('content', '')
+            
+            # 生成内容hash用于去重
+            content_hash = hash(content[:300])  # 使用前300字符生成hash
+            
+            # Web结果去重：相同URL或相似内容只保留一个
+            url_key = url.strip() if url else f"content_{content_hash}"
+            
+            if url_key not in seen_urls and content_hash not in seen_content_hashes:
+                deduplicated.append(result)
+                if url:
+                    seen_urls.add(url_key)
+                seen_content_hashes.add(content_hash)
+                
+                # 限制Web搜索结果数量
+                if len(deduplicated) >= 3:  # Web搜索结果最多保留3条
+                    break
+        
+        self.colored_logger.debug(f"🌐 Web结果去重: {len(results)} -> {len(deduplicated)}")
+        return deduplicated
 
     def _reason_and_act_for_section(self, section_context: Dict[str, str], state: ReActState) -> Optional[Dict[str, str]]:
         """合并推理和行动阶段"""
@@ -241,7 +680,7 @@ class EnhancedReactAgent:
             self.colored_logger.error(f"推理与行动阶段出错: {e}")
             return None
 
-    def _observe_section_results(self, query: str, section_context: Dict[str, str], state: ReActState = None) -> Tuple[List[Dict], float]:
+    def _observe_section_results(self, query: str, section_context: Dict[str, str], state: ReActState = None) -> List[Dict]:
         """观察阶段（使用外部API进行文档搜索）"""
         query_start_time = time.time()
         
@@ -260,8 +699,12 @@ class EnhancedReactAgent:
             
             # 执行外部API文档搜索
             api_start_time = time.time()
-            keywords = [k.strip() for k in query.replace('，', ',').split(',') if k.strip()]
-            combined_query = " ".join(keywords[:3])
+            
+            # 多维度查询模式：直接使用传入的精准查询词组
+            combined_query = query.strip()
+            
+            # 记录查询信息
+            self.colored_logger.debug(f"🔍 执行查询: '{combined_query}'")
             
             # 使用混合内容搜索API
             search_results = self.external_api.document_search(
@@ -361,9 +804,6 @@ class EnhancedReactAgent:
                 self.colored_logger.observation("📭 检索未返回结果")
                 all_results = []
             
-            # 质量评估
-            quality_score = self._evaluate_section_results_quality(all_results, section_context, query)
-            
             # 记录成功的查询
             if self.has_smart_control:
                 self.concurrency_manager.record_api_request(
@@ -373,7 +813,7 @@ class EnhancedReactAgent:
                 )
             self.react_stats['successful_queries'] += 1
             
-            return all_results, quality_score
+            return all_results
             
         except Exception as e:
             # 记录失败的查询
@@ -389,7 +829,7 @@ class EnhancedReactAgent:
             self.react_stats['failed_queries'] += 1
             
             self.colored_logger.error(f"观察阶段失败: {e}")
-            return [], 0.0
+            return []
     
 
 
@@ -436,6 +876,52 @@ class EnhancedReactAgent:
             return max(0.0, min(1.0, float(score_match.group()))) if score_match else 0.2
         except Exception: return 0.1
 
+    def _evaluate_overall_rag_quality(self, all_results: List[Dict], section_context: Dict[str, str]) -> float:
+        """对所有RAG结果进行整体质量评估"""
+        if not all_results: 
+            return 0.0
+        
+        # 安全地处理内容，确保转换为字符串
+        def safe_content_str(result):
+            content = result.get('content', result)
+            if isinstance(content, (list, dict)):
+                return str(content)[:150]
+            return str(content)[:150]
+        
+        # 统计不同类型的结果
+        text_count = len([r for r in all_results if r.get('type') == 'text'])
+        image_count = len([r for r in all_results if r.get('type') == 'image'])
+        table_count = len([r for r in all_results if r.get('type') == 'table'])
+        
+        evaluation_prompt = f"""
+评估以下RAG检索结果对章节写作的整体适用性：
+
+【目标章节】: {section_context['subtitle']}
+【写作指导】: {section_context['how_to_write']}
+【检索结果统计】: 文本{text_count}条, 图片{image_count}条, 表格{table_count}条, 总计{len(all_results)}条
+【结果样本】: {chr(10).join(f"- {safe_content_str(r)}..." for r in all_results[:5])}
+
+【评估要求】: 
+1. 综合考虑结果的数量、质量、相关性和完整性
+2. 评估是否能支撑该章节的写作需求
+3. 只返回一个0.0到1.0的小数评分，不要其他内容
+
+评分标准：
+- 0.8-1.0: 结果丰富且高度相关，完全支撑写作
+- 0.6-0.8: 结果较好，基本支撑写作需求
+- 0.4-0.6: 结果一般，部分支撑写作
+- 0.0-0.4: 结果不足或相关性差
+"""
+        try:
+            response = self.client.generate(evaluation_prompt)
+            score_match = re.search(r'0?\.\d+|[01]', response)
+            quality_score = max(0.0, min(1.0, float(score_match.group()))) if score_match else 0.2
+            self.colored_logger.debug(f"📊 整体RAG质量评估: {quality_score:.3f}")
+            return quality_score
+        except Exception as e:
+            self.colored_logger.error(f"整体质量评估失败: {e}")
+            return 0.1
+
     def _reflect(self, state: ReActState, current_quality: float) -> bool:
         """反思阶段"""
         if current_quality >= self.quality_threshold:
@@ -462,6 +948,7 @@ class EnhancedReactAgent:
         retrieved_text = []
         retrieved_image = []
         retrieved_table = []
+        retrieved_web = []  # 新增Web搜索结果分组
         
         for result in state.retrieved_results:
             result_type = result.get('type', 'text')
@@ -471,24 +958,32 @@ class EnhancedReactAgent:
                 retrieved_image.append(result)
             elif result_type == 'table':
                 retrieved_table.append(result)
+            elif result_type == 'web_text':
+                retrieved_web.append(result)
             else:
                 # 默认归类为文本
                 retrieved_text.append(result)
         
         # 添加调试日志，显示分组结果
-        self.colored_logger.debug(f"📊 分组结果: 文本{len(retrieved_text)}条, 图片{len(retrieved_image)}条, 表格{len(retrieved_table)}条")
+        self.colored_logger.debug(f"📊 分组结果: 文本{len(retrieved_text)}条, 图片{len(retrieved_image)}条, 表格{len(retrieved_table)}条, Web{len(retrieved_web)}条")
         
         # 显示图片结果的详细信息
         for i, img in enumerate(retrieved_image):
             self.colored_logger.debug(f"📸 图片{i+1}: 路径={img.get('path', 'N/A')}, 页数={img.get('page_number', 'N/A')}, 描述={img.get('description', 'N/A')[:50]}...")
         
-        # 分段搜索模式，不进行去重处理
-        self.colored_logger.debug(f"📊 分段搜索结果: 文本{len(retrieved_text)}条, 图片{len(retrieved_image)}条, 表格{len(retrieved_table)}条")
+        # 多维度查询模式：进行智能去重处理
+        retrieved_text = self._deduplicate_results(retrieved_text, 'text')
+        retrieved_image = self._deduplicate_results(retrieved_image, 'image') 
+        retrieved_table = self._deduplicate_results(retrieved_table, 'table')
+        retrieved_web = self._deduplicate_results(retrieved_web, 'web_text')
+        
+        self.colored_logger.debug(f"📊 去重后结果: 文本{len(retrieved_text)}条, 图片{len(retrieved_image)}条, 表格{len(retrieved_table)}条, Web{len(retrieved_web)}条")
         
         # 分段搜索结果统计
         self.colored_logger.observation(f"📊 最终结果统计: 文本{len(retrieved_text)}条, "
                                       f"图片{len(retrieved_image)}条, "
-                                      f"表格{len(retrieved_table)}条")
+                                      f"表格{len(retrieved_table)}条, "
+                                      f"Web{len(retrieved_web)}条")
 
         # 确保图片结果包含完整的路径和描述信息
         final_image_results = []
@@ -533,8 +1028,21 @@ class EnhancedReactAgent:
                 'score': text_result.get('score', 1.0)
             })
 
+        # 处理Web搜索结果
+        final_web_results = []
+        for web_result in retrieved_web:
+            final_web_results.append({
+                'content': web_result.get('content', ''),
+                'source': web_result.get('source', 'Web搜索'),
+                'type': 'web_text',
+                'url': web_result.get('url', ''),
+                'title': web_result.get('title', ''),
+                'score': web_result.get('score', 1.0)
+            })
+
         return {
             'retrieved_text': final_text_results,
             'retrieved_image': final_image_results,
-            'retrieved_table': final_table_results
+            'retrieved_table': final_table_results,
+            'retrieved_web': final_web_results
         }
