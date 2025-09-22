@@ -219,7 +219,7 @@ class EnhancedReactAgent:
         # 并行执行多个RAG查询
         all_results = []
         
-        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(multi_queries), 2)) as executor:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(len(multi_queries), 3)) as executor:
             future_to_query = {
                 executor.submit(self._execute_single_query, query_info, section_context, state): query_info
                 for query_info in multi_queries
