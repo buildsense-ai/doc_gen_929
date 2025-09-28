@@ -123,11 +123,14 @@ class EnhancedReactAgent:
         except Exception as e:
             self.colored_logger.error(f"❌ 外部API服务连接检查失败: {e}，将使用本地RAG作为备用")
         
-        # 检查Web搜索服务状态
+        # 检查Web搜索服务状态（支持跳过）
         try:
             web_status = self.web_search_client.check_service_status()
             if web_status.get('status') == 'running':
-                self.colored_logger.info(f"✅ Web搜索服务连接正常: {web_status.get('service', '')}")
+                if web_status.get('skipped'):
+                    self.colored_logger.info("✅ Web搜索服务假定可用（已跳过健康检查）")
+                else:
+                    self.colored_logger.info(f"✅ Web搜索服务连接正常: {web_status.get('service', '')}")
             else:
                 self.colored_logger.warning(f"⚠️ Web搜索服务状态异常: {web_status}")
         except Exception as e:

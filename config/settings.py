@@ -376,6 +376,16 @@ def setup_logging():
     """设置日志系统 - 支持UTF-8编码"""
     config = SYSTEM_CONFIG['logging']
     
+    # 预保存需保留的特殊handler（来自API服务的SSE桥接），避免后续force=True清空后丢失
+    try:
+        existing_handlers = list(logging.getLogger().handlers)
+        preserved_handlers = [
+            h for h in existing_handlers
+            if h.__class__.__name__ in ("TaskLogHandler", "TaskScopedHandler")
+        ]
+    except Exception:
+        preserved_handlers = []
+
     # 创建formatter
     formatter = logging.Formatter(config['format'])
     
@@ -392,8 +402,8 @@ def setup_logging():
         file_handler.setFormatter(formatter)
         handlers.append(file_handler)
     
-    # 控制台handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    # 控制台handler（固定到原始stdout，避免运行时替换sys.stdout导致控制台日志丢失）
+    console_handler = logging.StreamHandler(getattr(sys, '__stdout__', sys.stdout))
     console_handler.setFormatter(formatter)
     handlers.append(console_handler)
     
@@ -403,6 +413,16 @@ def setup_logging():
         handlers=handlers,
         force=True  # 强制重新配置日志
     )
+    # 重新附加被保留的特殊handler
+    try:
+        root_logger = logging.getLogger()
+        for h in preserved_handlers:
+            try:
+                root_logger.addHandler(h)
+            except Exception:
+                pass
+    except Exception:
+        pass
     
     # 获取根日志记录器并设置立即刷新
     root_logger = logging.getLogger()

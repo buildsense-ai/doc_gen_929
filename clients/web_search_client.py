@@ -4,6 +4,7 @@ Web 搜索客户端
 """
 
 import requests
+import os
 import json
 import logging
 from typing import Dict, List, Optional, Any
@@ -107,6 +108,17 @@ class WebSearchClient:
     def check_service_status(self) -> Dict[str, Any]:
         """检查 Web 搜索服务状态"""
         try:
+            # 允许通过环境变量跳过健康检查，避免浪费一次查询
+            skip = os.getenv("WEB_SEARCH_SKIP_HEALTH_CHECK", os.getenv("SKIP_HEALTH_CHECK", "false")).lower() == "true"
+            if skip:
+                self.logger.info("🔄 已跳过Web搜索健康检查（配置）")
+                return {
+                    'status': 'running',
+                    'service': 'Web Search API',
+                    'endpoint': self.search_endpoint,
+                    'skipped': True
+                }
+
             # 尝试一个简单的搜索来检查服务状态
             test_result = self.search("test", max_results=1)
             if test_result:

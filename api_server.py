@@ -35,7 +35,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 import uvicorn
 import json
+import re
 import time
+import threading
+from contextvars import ContextVar
 
 # 导入主要组件
 try:
@@ -74,14 +77,152 @@ pipeline: Optional[DocumentGenerationPipeline] = None
 generation_tasks: Dict[str, Dict[str, Any]] = {}  # 存储任务状态
 file_storage: Dict[str, str] = {}  # 存储文件映射
 
+# ===== 日志桥接到SSE（按任务） =====
+
+# 线程ID → 任务ID 映射（将后台执行线程产生的日志绑定到当前任务）
+_thread_task_map: Dict[int, str] = {}
+# 正在通过SSE流式传输的任务集合：用于避免与全局桥接器重复推送
+_active_sse_tasks: set[str] = set()
+# 任务SSE选项（例如是否详细输出）
+_task_stream_options: Dict[str, Dict[str, Any]] = {}
+
+# 非verbose模式下抑制的标准日志片段
+_SSE_SUPPRESSED_PATTERNS = [
+    "初始化完成",
+    "文档生成智能速率控制器初始化",
+    "已跳过Web搜索健康检查",
+    "Sending request to OpenRouter",
+    "Token usage:",
+    "OpenRouter API调用成功",
+    "OpenRouter客户端会话已关闭",
+]
+
+class _StdIOTee:
+    """Duplicate writes to original stream and push per-line to task SSE logs based on thread→task映射。"""
+    def __init__(self, original_stream, source: str):
+        self._original = original_stream
+        self._source = source  # 'stdout' or 'stderr'
+        self._buffer = ''
+        self._lock = threading.Lock()
+
+    def write(self, data):
+        if not isinstance(data, str):
+            data = str(data)
+        with self._lock:
+            try:
+                self._original.write(data)
+                self._original.flush()
+            except Exception:
+                pass
+            self._buffer += data
+            while '\n' in self._buffer:
+                line, self._buffer = self._buffer.split('\n', 1)
+                try:
+                    task_id = _thread_task_map.get(threading.get_ident())
+                    if task_id and line.strip() != '':
+                        log_manager.add_log(task_id, {
+                            'type': 'info',
+                            'message': line,
+                            'source': self._source,
+                            'sse_only': True
+                        })
+                except Exception:
+                    pass
+
+    def flush(self):
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+class TaskLogHandler(logging.Handler):
+    """将标准日志路由到对应任务的SSE日志队列。"""
+    def emit(self, record: logging.LogRecord):
+        try:
+            # 避免递归：忽略本模块与uvicorn日志
+            if record.name in ("api_server", "uvicorn", "uvicorn.error", "uvicorn.access"):
+                return
+            task_id = _thread_task_map.get(getattr(record, 'thread', None))
+            if not task_id:
+                return
+            # 若该任务正在通过SSE流式输出，则由TaskScopedHandler负责推送，这里避免重复
+            if task_id in _active_sse_tasks:
+                return
+            level = record.levelname.lower()
+            log_type = 'error' if level == 'error' else ('warning' if level == 'warning' else 'info')
+            log_entry = {
+                'type': log_type,
+                'message': record.getMessage(),
+                'logger': record.name,
+            }
+            # 直接写入任务日志（内部会再写系统日志，但我们已屏蔽api_server，避免回环）
+            log_manager.add_log(task_id, log_entry)
+        except Exception:
+            # 避免SSE因日志处理异常而中断
+            pass
+
+class TaskScopedHandler(logging.Handler):
+    """将所有日志(全局)路由到指定task_id对应的SSE，不再写回系统logger，避免回环。"""
+    def __init__(self, task_id: str):
+        super().__init__()
+        self.task_id = task_id
+    def emit(self, record: logging.LogRecord):
+        try:
+            if record.name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
+                return
+            # 记录已被某个同task的处理器路由过，避免重复
+            routed_task = getattr(record, '_sse_routed_task_id', None)
+            if routed_task == self.task_id:
+                return
+            try:
+                setattr(record, '_sse_routed_task_id', self.task_id)
+            except Exception:
+                pass
+            # 非verbose模式抑制部分冗余初始化/计费日志
+            opts = _task_stream_options.get(self.task_id, {})
+            verbose = bool(opts.get('verbose', False))
+            message_text = record.getMessage()
+            if not verbose:
+                for frag in _SSE_SUPPRESSED_PATTERNS:
+                    if frag in message_text:
+                        return
+            level = record.levelname.lower()
+            log_type = 'error' if level == 'error' else ('warning' if level == 'warning' else 'info')
+            log_entry = {
+                'type': log_type,
+                'message': message_text,
+                'logger': record.name,
+                'sse_only': True,
+            }
+            log_manager.add_log(self.task_id, log_entry)
+        except Exception:
+            pass
+
+# 在线程池中执行的包装器：确保线程→任务ID映射存在，便于路由日志
+def _wrapped_generate_without_eval(task_id: str, query: str, project_name: str, output_dir: str):
+    try:
+        _thread_task_map[threading.get_ident()] = task_id
+        return pipeline.generate_document_without_evaluation(query, project_name, output_dir)
+    finally:
+        _thread_task_map.pop(threading.get_ident(), None)
+
+def _wrapped_one_click(task_id: str, query: str, project_name: str, output_dir: str, enable_review_and_regeneration: bool):
+    try:
+        _thread_task_map[threading.get_ident()] = task_id
+        return one_click_generate_document(query, project_name, output_dir, enable_review_and_regeneration)
+    finally:
+        _thread_task_map.pop(threading.get_ident(), None)
+
 # ===== 日志管理器 =====
 
 class LogManager:
     """任务日志管理器"""
     def __init__(self):
         self.task_logs: Dict[str, List[Dict[str, Any]]] = {}  # 存储任务日志
-        self.log_subscribers: Dict[str, List[asyncio.Queue]] = {}  # 存储日志订阅者
+        # 订阅者信息：{ task_id: [ { 'queue': asyncio.Queue, 'loop': asyncio.AbstractEventLoop } ] }
+        self.log_subscribers: Dict[str, List[Dict[str, Any]]] = {}
         self.max_logs_per_task = 1000  # 每个任务最多保存的日志数量
+        self.loop: Optional[asyncio.AbstractEventLoop] = None  # 主事件循环（用于跨线程安全推送）
         
     def add_log(self, task_id: str, log_entry: Dict[str, Any]):
         """添加日志条目"""
@@ -91,7 +232,29 @@ class LogManager:
         # 添加时间戳（如果没有的话）
         if 'timestamp' not in log_entry:
             log_entry['timestamp'] = datetime.now().isoformat()
-            
+        
+        # 统一去除ANSI颜色码，防止前端显示异常
+        try:
+            msg = str(log_entry.get('message', ''))
+            msg = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", msg)
+            log_entry['message'] = msg
+        except Exception:
+            pass
+
+        # 去重：与上一条完全相同则跳过
+        try:
+            last_entry = self.task_logs[task_id][-1] if self.task_logs[task_id] else None
+            if (
+                last_entry
+                and last_entry.get('message') == log_entry.get('message')
+                and last_entry.get('logger') == log_entry.get('logger')
+                and last_entry.get('type') == log_entry.get('type')
+            ):
+                # 跳过重复
+                return
+        except Exception:
+            pass
+
         self.task_logs[task_id].append(log_entry)
         
         # 限制日志数量，避免内存溢出
@@ -101,48 +264,81 @@ class LogManager:
         # 推送给所有订阅者
         self._notify_subscribers(task_id, log_entry)
         
-        # 同时记录到系统日志
-        log_level = log_entry.get('type', 'info')
-        message = f"[{task_id}] {log_entry.get('message', '')}"
-        if log_level == 'error':
-            logger.error(message)
-        elif log_level == 'warning':
-            logger.warning(message)
-        else:
-            logger.info(message)
+        # 同时记录到系统日志（避免递归：标记为sse_only的不再写回系统日志）
+        if not log_entry.get('sse_only'):
+            log_level = log_entry.get('type', 'info')
+            message = f"[{task_id}] {log_entry.get('message', '')}"
+            if log_level == 'error':
+                logger.error(message)
+            elif log_level == 'warning':
+                logger.warning(message)
+            else:
+                logger.info(message)
     
     def _notify_subscribers(self, task_id: str, log_entry: Dict[str, Any]):
-        """通知订阅者"""
-        if task_id in self.log_subscribers:
-            # 创建队列副本以避免迭代时修改
-            subscribers = self.log_subscribers[task_id].copy()
-            for queue in subscribers:
+        """通知订阅者（线程安全）：使用各自的事件循环调度写入队列"""
+        if task_id not in self.log_subscribers:
+            return
+
+        subscribers = list(self.log_subscribers[task_id])
+
+        def _queue_put_safe(q: asyncio.Queue, entry: Dict[str, Any]):
+            try:
+                q.put_nowait(entry)
+            except asyncio.QueueFull:
+                dropped = 0
                 try:
-                    queue.put_nowait(log_entry)
-                except asyncio.QueueFull:
-                    # 队列满了，移除这个订阅者
+                    while dropped < 10:
+                        q.get_nowait()
+                        dropped += 1
+                    q.put_nowait(entry)
+                except Exception:
+                    pass
+
+        for sub in subscribers:
+            try:
+                target_loop = sub.get('loop')
+                target_queue = sub.get('queue')
+                if target_loop and target_loop.is_running():
+                    target_loop.call_soon_threadsafe(_queue_put_safe, target_queue, log_entry)
+                elif self.loop and self.loop.is_running():
+                    # 回退：尝试在主循环调度（同循环时有效）
                     try:
-                        self.log_subscribers[task_id].remove(queue)
-                    except ValueError:
-                        pass  # 队列已经被移除
+                        self.loop.call_soon_threadsafe(_queue_put_safe, target_queue, log_entry)
+                    except Exception:
+                        pass
+                else:
+                    # 最后退化：直接调用（仅在同线程/无事件循环时）
+                    _queue_put_safe(target_queue, log_entry)
+            except Exception:
+                pass
     
     async def subscribe_logs(self, task_id: str) -> asyncio.Queue:
-        """订阅任务日志"""
-        queue = asyncio.Queue(maxsize=100)
+        """订阅任务日志（记录订阅者事件循环）"""
+        queue = asyncio.Queue(maxsize=1000)
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
         if task_id not in self.log_subscribers:
             self.log_subscribers[task_id] = []
-        self.log_subscribers[task_id].append(queue)
+        self.log_subscribers[task_id].append({'queue': queue, 'loop': loop})
         return queue
     
     def unsubscribe_logs(self, task_id: str, queue: asyncio.Queue):
         """取消订阅任务日志"""
         if task_id in self.log_subscribers:
             try:
-                self.log_subscribers[task_id].remove(queue)
-                if not self.log_subscribers[task_id]:  # 如果没有订阅者了
+                remaining: List[Dict[str, Any]] = []
+                for sub in self.log_subscribers[task_id]:
+                    if sub.get('queue') is not queue:
+                        remaining.append(sub)
+                if remaining:
+                    self.log_subscribers[task_id] = remaining
+                else:
                     del self.log_subscribers[task_id]
-            except ValueError:
-                pass  # 队列不在列表中
+            except Exception:
+                pass
     
     def get_logs(self, task_id: str) -> List[Dict[str, Any]]:
         """获取任务的所有日志"""
@@ -262,6 +458,20 @@ async def startup_event():
             logger.warning("⚠️ MinIO客户端连接失败，将使用本地文件存储")
         
         logger.info("🌟 Gauz文档Agent API服务启动完成！")
+        # 记录事件循环到日志管理器，便于跨线程安全推送SSE
+        try:
+            log_manager.loop = asyncio.get_event_loop()
+        except Exception:
+            pass
+
+        # 安装日志桥接处理器（一次）
+        try:
+            bridge_installed = any(isinstance(h, TaskLogHandler) for h in logging.getLogger().handlers)
+            if not bridge_installed:
+                logging.getLogger().addHandler(TaskLogHandler())
+                logger.info("✅ 已启用任务日志桥接到SSE")
+        except Exception as e:
+            logger.warning(f"⚠️ 启用日志桥接失败: {e}")
         
     except Exception as e:
         logger.error(f"❌ 服务启动失败: {e}")
@@ -332,9 +542,9 @@ async def stream_task_logs(task_id: str):
                     data = json.dumps(log_entry, ensure_ascii=False)
                     yield f"data: {data}\n\n"
                     
-                    # 如果任务已完成或失败，发送结束信号
-                    if log_entry.get('type') in ['success', 'error'] or log_entry.get('step') == '任务完成':
-                        # 等待一小段时间再结束连接
+                    # 仅在任务真正完成/失败，或收到显式完成信号时结束
+                    task_status = generation_tasks.get(task_id, {}).get('status')
+                    if task_status in ['completed', 'failed'] or log_entry.get('step') == '任务完成' or log_entry.get('type') == 'success':
                         await asyncio.sleep(1)
                         end_log = {
                             "timestamp": datetime.now().isoformat(),
@@ -354,6 +564,17 @@ async def stream_task_logs(task_id: str):
                     }
                     data = json.dumps(heartbeat, ensure_ascii=False)
                     yield f"data: {data}\n\n"
+                    # 心跳时也检查任务状态，避免因错误日志未触发完成而悬挂
+                    task_status = generation_tasks.get(task_id, {}).get('status')
+                    if task_status in ['completed', 'failed']:
+                        end_log = {
+                            "timestamp": datetime.now().isoformat(),
+                            "type": "stream_end",
+                            "message": "日志流结束"
+                        }
+                        data = json.dumps(end_log, ensure_ascii=False)
+                        yield f"data: {data}\n\n"
+                        break
                     
         except Exception as e:
             # 发送错误信息
@@ -372,10 +593,11 @@ async def stream_task_logs(task_id: str):
     
     return StreamingResponse(
         log_generator(),
-        media_type="text/event-stream",
+        media_type="text/event-stream; charset=utf-8",
         headers={
-            "Cache-Control": "no-cache",
+            "Cache-Control": "no-cache, no-transform",
             "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
             "Access-Control-Allow-Origin": "*",
             "Access-Control-Allow-Headers": "Cache-Control",
         }
@@ -524,6 +746,117 @@ async def generate_document_full(request: OneClickGenerationRequest, background_
         files=None
     )
 
+@app.post("/generate_document/stream")
+async def generate_document_stream(request: OneClickGenerationRequest):
+    """
+    以SSE实时推送日志的文档生成接口（完整工作流）。
+    - 提交后立即创建任务并启动后台执行
+    - 同一HTTP连接中以Server-Sent Events推送历史与实时日志，直至任务完成
+    """
+    task_id = str(uuid.uuid4())
+    task_info = {
+        "task_id": task_id,
+        "status": "pending",
+        "progress": "任务已提交，等待处理",
+        "created_at": datetime.now(),
+        "updated_at": datetime.now(),
+        "request": request.dict(),
+        "result": None,
+        "error": None
+    }
+    generation_tasks[task_id] = task_info
+
+    async def event_generator():
+        log_queue = None
+        # 为本任务安装任务级日志处理器，捕获所有logger输出（跨线程），并加入活动集合避免重复
+        root_logger = logging.getLogger()
+        task_handler = TaskScopedHandler(task_id)
+        root_logger.addHandler(task_handler)
+        _active_sse_tasks.add(task_id)
+        # 记录SSE选项（当前仅支持verbose，通过查询参数传递）
+        try:
+            from fastapi import Request as _FastAPIRequest  # 避免顶部导入冲突
+        except Exception:
+            _FastAPIRequest = None
+        try:
+            # 读取查询参数 verbose=true/false
+            # 运行时从fastapi的request对象取（若前端传递了）
+            # 若获取失败，则默认False
+            verbose_flag = False
+            if hasattr(request, '__dict__') and 'query' in request.__dict__:
+                # 这是Pydantic模型，不包含query params
+                pass
+            # 通过全局app依赖注入的方式不可用，这里采用环境默认False
+            _task_stream_options[task_id] = { 'verbose': verbose_flag }
+        except Exception:
+            _task_stream_options[task_id] = { 'verbose': False }
+        try:
+            # 订阅日志
+            log_queue = await log_manager.subscribe_logs(task_id)
+
+            # 启动后台完整工作流
+            asyncio.create_task(run_one_click_generation(task_id, request))
+
+            # 首帧：初始化事件
+            init_evt = {
+                "type": "init",
+                "message": "任务已创建，开始推送日志",
+                "task_id": task_id,
+                "query": request.query,
+                "project_name": request.project_name
+            }
+            yield f"data: {json.dumps(init_evt, ensure_ascii=False)}\n\n"
+
+            # 推送历史日志（如果有）
+            historical_logs = log_manager.get_logs(task_id)
+            for log_entry in historical_logs:
+                yield f"data: {json.dumps(log_entry, ensure_ascii=False)}\n\n"
+
+            # 实时日志
+            while True:
+                try:
+                    log_entry = await asyncio.wait_for(log_queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(log_entry, ensure_ascii=False)}\n\n"
+                    if log_entry.get('type') in ['success', 'error'] or log_entry.get('step') == '任务完成':
+                        await asyncio.sleep(1)
+                        end_evt = {"type": "stream_end", "message": "日志流结束"}
+                        yield f"data: {json.dumps(end_evt, ensure_ascii=False)}\n\n"
+                        break
+                except asyncio.TimeoutError:
+                    heartbeat = {
+                        "timestamp": datetime.now().isoformat(),
+                        "type": "heartbeat",
+                        "message": "连接正常"
+                    }
+                    yield f"data: {json.dumps(heartbeat, ensure_ascii=False)}\n\n"
+        finally:
+            if log_queue:
+                log_manager.unsubscribe_logs(task_id, log_queue)
+            try:
+                root_logger.removeHandler(task_handler)
+            except Exception:
+                pass
+            try:
+                _active_sse_tasks.discard(task_id)
+            except Exception:
+                pass
+            try:
+                _task_stream_options.pop(task_id, None)
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream; charset=utf-8",
+        headers={
+            "Cache-Control": "no-cache, no-transform",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Headers": "Cache-Control",
+        }
+    )
+
 @app.get("/tasks/{task_id}", response_model=TaskStatus)
 async def get_task_status(task_id: str):
     """获取任务状态"""
@@ -588,6 +921,11 @@ async def download_file(file_id: str):
 async def run_document_generation(task_id: str, request: DocumentGenerationRequest):
     """后台执行文档生成任务"""
     task_info = generation_tasks[task_id]
+    # 将当前线程绑定到任务，用于日志桥接
+    try:
+        _thread_task_map[threading.get_ident()] = task_id
+    except Exception:
+        pass
     
     try:
         # 推送开始日志
@@ -639,8 +977,9 @@ async def run_document_generation(task_id: str, request: DocumentGenerationReque
         # 在新的线程中运行同步代码（API模式，跳过质量评估）
         loop = asyncio.get_event_loop()
         result_files = await loop.run_in_executor(
-            None, 
-            pipeline.generate_document_without_evaluation, 
+            None,
+            _wrapped_generate_without_eval,
+            task_id,
             request.query,
             request.project_name,
             output_dir
@@ -760,13 +1099,26 @@ async def run_document_generation(task_id: str, request: DocumentGenerationReque
         logger.error(f"❌ 文档生成任务失败: {task_id} - {e}")
     finally:
         # 任务完成后清理日志订阅者（但保留日志1小时）
+        try:
+            _thread_task_map.pop(threading.get_ident(), None)
+        except Exception:
+            pass
         log_manager.cleanup_task_logs(task_id)
 
 
 async def run_one_click_generation(task_id: str, request: OneClickGenerationRequest):
     """后台执行一键工作流任务（包含评审/再生/合并）"""
     task_info = generation_tasks[task_id]
+    # 将当前线程绑定到任务，用于日志桥接
     try:
+        _thread_task_map[threading.get_ident()] = task_id
+    except Exception:
+        pass
+    try:
+        # 将stdout/stderr tee到任务SSE
+        original_stdout, original_stderr = sys.stdout, sys.stderr
+        sys.stdout = _StdIOTee(original_stdout, 'stdout')
+        sys.stderr = _StdIOTee(original_stderr, 'stderr')
         # 启动日志
         log_manager.add_log(task_id, {
             "type": "info",
@@ -799,7 +1151,8 @@ async def run_one_click_generation(task_id: str, request: OneClickGenerationRequ
         loop = asyncio.get_event_loop()
         result = await loop.run_in_executor(
             None,
-            one_click_generate_document,
+            _wrapped_one_click,
+            task_id,
             request.query,
             request.project_name,
             output_dir,
@@ -904,6 +1257,16 @@ async def run_one_click_generation(task_id: str, request: OneClickGenerationRequ
         task_info["updated_at"] = datetime.now()
         logger.error(f"❌ 完整工作流任务失败: {task_id} - {e}")
     finally:
+        try:
+            _thread_task_map.pop(threading.get_ident(), None)
+        except Exception:
+            pass
+        # 恢复stdout/stderr
+        try:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
+        except Exception:
+            pass
         log_manager.cleanup_task_logs(task_id)
 
 # ===== 字段搜索接口 =====
