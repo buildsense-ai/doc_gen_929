@@ -106,7 +106,7 @@ class EnhancedOrchestratorAgent:
                     time.sleep(delay)
             
             # 构建模板查询语句
-            template_query = f"文档模板 结构 {user_description}"
+            template_query = f"{user_description}"
             
             # 记录API调用
             api_start_time = time.time()
