@@ -21,6 +21,7 @@ import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
 from pathlib import Path
+import shutil
 
 # 必须在所有其他导入之前禁用ChromaDB telemetry
 os.environ['ANONYMIZED_TELEMETRY'] = 'False'
@@ -359,6 +360,30 @@ class LogManager:
 log_manager = LogManager()
 
 # ===== 数据模型 =====
+
+# ===== 实用函数：带重试的目录清理（解决Windows句柄占用） =====
+async def _async_rmtree_with_retries(task_id: str, dir_path: str, max_retries: int = 5, delay_seconds: float = 0.5):
+    """异步后台清理目录，带重试，适配Windows偶发文件句柄未释放问题。"""
+    if not dir_path or not os.path.isdir(dir_path):
+        return
+    for attempt in range(1, max_retries + 1):
+        try:
+            shutil.rmtree(dir_path)
+            log_manager.add_log(task_id, {
+                "type": "info",
+                "message": f"输出目录已删除: {dir_path}",
+                "step": "目录清理",
+            })
+            return
+        except Exception as e:
+            if attempt >= max_retries:
+                log_manager.add_log(task_id, {
+                    "type": "warning",
+                    "message": f"目录清理失败(已重试{attempt}次): {dir_path}，原因: {e}",
+                    "step": "目录清理",
+                })
+                return
+            await asyncio.sleep(delay_seconds)
 
 class DocumentGenerationRequest(BaseModel):
     """文档生成请求模型"""
@@ -1027,6 +1052,58 @@ async def run_document_generation(task_id: str, request: DocumentGenerationReque
                     "step": "上传完成",
                     "minio_files": len(minio_urls)
                 })
+                # 删除已成功上传到MinIO的本地文件，避免重复存储
+                try:
+                    removed_local = 0
+                    for ftype, remote in minio_urls.items():
+                        local_path = result_files.get(ftype)
+                        if local_path and os.path.exists(local_path):
+                            try:
+                                os.remove(local_path)
+                                removed_local += 1
+                                # 清理本地下载映射与链接
+                                try:
+                                    # 移除对应的file_id映射
+                                    to_delete_ids = [fid for fid, fpath in file_storage.items() if fpath == local_path]
+                                    for fid in to_delete_ids:
+                                        file_storage.pop(fid, None)
+                                    # 移除local链接
+                                    if ftype in file_links:
+                                        file_links.pop(ftype, None)
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                    if removed_local:
+                        log_manager.add_log(task_id, {
+                            "type": "info",
+                            "message": f"已删除本地文件 {removed_local} 个（已上传至MinIO）",
+                            "progress": 92,
+                            "step": "本地清理"
+                        })
+                except Exception:
+                    pass
+                # 若所有需要上传的文件均有对应的MinIO URL，则删除整个任务输出目录
+                try:
+                    output_dir_path = result_files.get("output_directory")
+                    if output_dir_path and os.path.isdir(output_dir_path):
+                        # 判断是否所有非目录项都有上传
+                        all_uploaded = True
+                        for ftype, local_path in result_files.items():
+                            if ftype == "output_directory":
+                                continue
+                            if local_path and os.path.exists(local_path):
+                                # 仍存在未被删除的文件，说明未全部上传成功
+                                all_uploaded = False
+                                break
+                        if all_uploaded:
+                            # 异步后台强制清理整个目录（带重试，兼容Windows占用）
+                            try:
+                                asyncio.create_task(_async_rmtree_with_retries(task_id, output_dir_path))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
             else:
                 logger.warning(f"⚠️ MinIO上传失败，仅提供本地下载")
                 log_manager.add_log(task_id, {
@@ -1218,6 +1295,47 @@ async def run_one_click_generation(task_id: str, request: OneClickGenerationRequ
         })
 
         minio_urls = upload_document_files(files_to_publish, task_id)
+        # 删除成功上传的本地文件，避免重复存储
+        try:
+            removed_local = 0
+            for ftype, remote in (minio_urls or {}).items():
+                local_path = files_to_publish.get(ftype)
+                if local_path and os.path.exists(local_path):
+                    try:
+                        os.remove(local_path)
+                        removed_local += 1
+                        # 清理本地下载映射与链接
+                        try:
+                            to_delete_ids = [fid for fid, fpath in file_storage.items() if fpath == local_path]
+                            for fid in to_delete_ids:
+                                file_storage.pop(fid, None)
+                            if ftype in file_links:
+                                file_links.pop(ftype, None)
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+            if removed_local:
+                log_manager.add_log(task_id, {
+                    "type": "info",
+                    "message": f"已删除本地文件 {removed_local} 个（已上传至MinIO）",
+                    "progress": 88,
+                    "step": "本地清理"
+                })
+        except Exception:
+            pass
+        # 若所有需上传文件都已成功上传（本地已删除），则清空输出目录
+        try:
+            output_dir_path = result.get("output_directory")
+            if output_dir_path and os.path.isdir(output_dir_path):
+                # 目录中若只剩空结构或已无文件，则删除整个目录
+                try:
+                    # 异步后台强制清理整个目录（带重试，兼容Windows占用）
+                    asyncio.create_task(_async_rmtree_with_retries(task_id, output_dir_path))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # 完成
         task_info["status"] = "completed"

@@ -12,6 +12,7 @@ import time
 from typing import Dict, Any, List, Optional
 from openai import OpenAI
 from dataclasses import dataclass, field
+import os
 
 
 @dataclass
@@ -68,14 +69,17 @@ class ColoredLogger:
 class DocumentReviewer:
     """文档质量评估器"""
     
-    def __init__(self, api_key: str = "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"):
+    def __init__(self, api_key: Optional[str] = None):
         """
         初始化文档评估器
         
         Args:
             api_key: OpenRouter API密钥
         """
-        self.api_key = api_key
+        # 优先使用显式传入，其次读取环境变量，避免硬编码泄露
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY", "")
+        if not self.api_key:
+            raise ValueError("缺少 OPENROUTER_API_KEY，请在环境变量中配置或传入 api_key")
         self.colored_logger = ColoredLogger(__name__)
         
         # 初始化OpenAI客户端

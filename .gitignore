@@ -1,0 +1,9 @@
+# Environment files (may contain API keys)
+.env
+.env.*
+**/.env
+**/.env.*
+
+# Keep examples
+!.env.example
+

@@ -5,7 +5,7 @@
       <paths name="root@43.139.19.144:22 password">
         <serverdata>
           <mappings>
-            <mapping deploy="doc_gen_8_10" local="$PROJECT_DIR$" web="/" />
+            <mapping deploy="doc_gen_9_29" local="$PROJECT_DIR$" web="/" />
           </mappings>
         </serverdata>
       </paths>
