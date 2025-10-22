@@ -28,10 +28,17 @@ class OpenRouterClient:
     def __init__(self):
         self.config = get_config()['openrouter']
         self.logger = logging.getLogger(f"{__name__}.{self.__class__.__name__}")
+
+        # OpenRouter需要有效的API密钥；没有密钥时立即提示，避免无意义的请求
+        self.api_key = (self.config.get("api_key") or "").strip()
+        if not self.api_key:
+            raise RuntimeError(
+                "OpenRouter API 密钥未配置。请在环境变量 OPENROUTER_API_KEY 或 .env 文件中设置有效的密钥。"
+            )
         
         # 设置请求头
         self.headers = {
-            'Authorization': f'Bearer {self.config["api_key"]}',
+            'Authorization': f'Bearer {self.api_key}',
             'Content-Type': 'application/json',
             'HTTP-Referer': 'https://github.com/your-repo',  # 可选：添加引用来源
             'X-Title': 'Gauz-Document-Agent',  # 可选：添加应用标题
@@ -124,7 +131,9 @@ class OpenRouterClient:
                     
                     # 对于某些错误状态码，直接返回而不重试
                     if response.status_code in [401, 403, 404]:
-                        return f"API call failed: {response.status_code}"
+                        raise RuntimeError(
+                            "OpenRouter API 身份验证失败，请确认 OPENROUTER_API_KEY 是否正确。"
+                        )
                     
                     # 对于其他错误，如果不是最后一次尝试，则继续重试
                     if attempt < max_retries - 1:

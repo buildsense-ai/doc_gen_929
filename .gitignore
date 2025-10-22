@@ -6,4 +6,5 @@
 
 # Keep examples
 !.env.example
+!.env_minio_example
 

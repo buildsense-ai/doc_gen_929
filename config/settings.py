@@ -7,8 +7,19 @@ from typing import Dict, Any, Optional
 import sys
 import os
 
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
 # 添加Document_Agent路径以导入高级速率控制器
 sys.path.append(os.path.join(os.path.dirname(os.path.dirname(__file__)), 'Document_Agent'))
+
+# 优先加载根目录下的.env，确保API密钥和其他配置在第一次读取前就位
+_project_root = os.path.dirname(os.path.dirname(__file__))
+_env_path = os.path.join(_project_root, '.env')
+if load_dotenv and os.path.exists(_env_path):
+    load_dotenv(dotenv_path=_env_path, override=True)
 
 # 系统配置
 SYSTEM_CONFIG = {

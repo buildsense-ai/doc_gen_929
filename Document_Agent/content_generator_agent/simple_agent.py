@@ -112,6 +112,8 @@ class SimpleContentGeneratorAgent:
             }
             
             self.logger.info(f"生成完成: {subtitle} ({result['word_count']}字, 最终分数: {final_score:.3f})")
+            if result['content']:
+                self.logger.info("章节内容：\n%s", result['content'])
             
             return result
             
