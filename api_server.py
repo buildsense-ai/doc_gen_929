@@ -200,17 +200,17 @@ class TaskScopedHandler(logging.Handler):
             pass
 
 # 在线程池中执行的包装器：确保线程→任务ID映射存在，便于路由日志
-def _wrapped_generate_without_eval(task_id: str, query: str, project_name: str, output_dir: str):
+def _wrapped_generate_without_eval(task_id: str, query: str, project_name: str, output_dir: str, guide_id: Optional[str] = None):
     try:
         _thread_task_map[threading.get_ident()] = task_id
-        return pipeline.generate_document_without_evaluation(query, project_name, output_dir)
+        return pipeline.generate_document_without_evaluation(query, project_name, output_dir, guide_id=guide_id)
     finally:
         _thread_task_map.pop(threading.get_ident(), None)
 
-def _wrapped_one_click(task_id: str, query: str, project_name: str, output_dir: str, enable_review_and_regeneration: bool):
+def _wrapped_one_click(task_id: str, query: str, project_name: str, output_dir: str, enable_review_and_regeneration: bool, guide_id: Optional[str] = None):
     try:
         _thread_task_map[threading.get_ident()] = task_id
-        return one_click_generate_document(query, project_name, output_dir, enable_review_and_regeneration)
+        return one_click_generate_document(query, project_name, output_dir, enable_review_and_regeneration, guide_id=guide_id)
     finally:
         _thread_task_map.pop(threading.get_ident(), None)
 
@@ -403,15 +403,53 @@ class OneClickGenerationRequest(BaseModel):
     query: str = Field(..., description="文档生成需求描述", min_length=1, max_length=2000)
     project_name: str = Field(..., description="项目名称，用于RAG检索", min_length=1, max_length=100)
     enable_review_and_regeneration: bool = Field(default=False, description="是否启用评审+再生+合并")
+    guide_id: Optional[str] = Field(None, description="可选的模板ID，如果提供则使用指定模板")
 
     class Config:
         json_schema_extra = {
             "example": {
                 "query": "我想生成一个关于医灵古庙的文物影响评估报告",
                 "project_name": "医灵古庙",
-                "enable_review_and_regeneration": False
+                "enable_review_and_regeneration": False,
+                "guide_id": None
             }
         }
+
+class SmartGenerationRequest(BaseModel):
+    """智能文档生成请求模型（支持模板推荐、指定模板、创建新模板三种模式）"""
+    query: str = Field(..., description="文档生成需求描述", min_length=1, max_length=2000)
+    project_name: str = Field(..., description="项目名称，用于RAG检索", min_length=1, max_length=100)
+    enable_review_and_regeneration: bool = Field(default=False, description="是否启用评审+再生+合并")
+    guide_id: Optional[str] = Field(None, description="模板控制参数：'__SUGGEST__'=推荐模板，具体ID=使用指定模板，None/''=创建新模板")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "我想生成一个关于医灵古庙的文物影响评估报告",
+                "project_name": "医灵古庙",
+                "enable_review_and_regeneration": False,
+                "guide_id": "__SUGGEST__"
+            }
+        }
+
+class TemplateRecommendation(BaseModel):
+    """推荐模板模型 - 完整返回外部API的原始数据"""
+    guide_id: str = Field(..., description="模板ID")
+    template_name: str = Field(..., description="模板名称")
+    report_guide: Dict[str, Any] = Field(..., description="模板完整内容")
+    similarity: float = Field(..., description="相关性分数")
+    
+    class Config:
+        extra = "allow"  # 允许额外字段
+
+class SmartGenerationResponse(BaseModel):
+    """智能文档生成响应模型"""
+    status: str = Field(..., description="状态：suggest（推荐模板）、generating（生成中）、completed（已完成）、failed（失败）")
+    message: str = Field(..., description="响应消息")
+    task_id: Optional[str] = Field(None, description="任务ID（生成模式）")
+    suggestions: Optional[List[TemplateRecommendation]] = Field(None, description="推荐的模板列表（推荐模式）")
+    files: Optional[Dict[str, str]] = Field(None, description="生成的文件（本地下载链接）")
+    minio_urls: Optional[Dict[str, str]] = Field(None, description="MinIO存储的文件下载链接")
 
 class ConcurrencySettings(BaseModel):
     """并发设置模型"""
@@ -737,6 +775,98 @@ async def set_concurrency(settings: ConcurrencySettings):
 #         message=f"文档生成任务已提交，任务ID: {task_id}",
 #         files=None
     # )
+
+@app.post("/smart_generate_document", response_model=SmartGenerationResponse)
+async def smart_generate_document(request: SmartGenerationRequest, background_tasks: BackgroundTasks):
+    """
+    智能文档生成接口 - 支持三种模式：
+    1. guide_id == "__SUGGEST__": 返回推荐的3个模板
+    2. guide_id 为具体ID: 使用指定模板生成文档
+    3. guide_id 为 None 或空字符串: 创建新模板并生成文档
+    """
+    from clients.external_api_client import get_external_api_client
+    
+    guide_id = request.guide_id
+    
+    # 模式1：推荐模板
+    if guide_id == "__SUGGEST__":
+        logger.info(f"🔍 模式1：查找推荐模板 - {request.query}")
+        
+        try:
+            external_api = get_external_api_client()
+            # 使用异步版本
+            templates = await external_api.search_top3_templates_async(request.query)
+            
+            if templates and len(templates) > 0:
+                # 直接返回原始模板数据，不做字段过滤
+                suggestions = [TemplateRecommendation(**t) for t in templates]
+                
+                logger.info(f"✅ 找到 {len(suggestions)} 个推荐模板")
+                return SmartGenerationResponse(
+                    status="suggest",
+                    message=f"成功找到 {len(suggestions)} 个推荐模板",
+                    suggestions=suggestions
+                )
+            else:
+                logger.info("📭 未找到推荐模板")
+                return SmartGenerationResponse(
+                    status="suggest",
+                    message="未找到匹配的推荐模板",
+                    suggestions=[]
+                )
+                
+        except Exception as e:
+            logger.error(f"❌ 查找推荐模板失败: {e}")
+            raise HTTPException(status_code=500, detail=f"查找推荐模板失败: {str(e)}")
+    
+    # 模式2和3：生成文档（带或不带模板ID）
+    else:
+        # 生成任务ID
+        task_id = str(uuid.uuid4())
+        
+        # 确定使用的模板ID（None、空字符串或具体ID）
+        final_guide_id = guide_id if guide_id and guide_id.strip() else None
+        
+        if final_guide_id:
+            logger.info(f"📋 模式2：使用指定模板生成文档 - 模板ID: {final_guide_id}")
+        else:
+            logger.info(f"🔧 模式3：创建新模板并生成文档")
+        
+        # 创建任务记录
+        task_info = {
+            "task_id": task_id,
+            "status": "pending",
+            "progress": "任务已提交，等待处理",
+            "created_at": datetime.now(),
+            "updated_at": datetime.now(),
+            "request": request.dict(),
+            "result": None,
+            "error": None
+        }
+        generation_tasks[task_id] = task_info
+        
+        # 转换为 OneClickGenerationRequest 并添加后台任务
+        # 注意：对于智能生成接口，如果用户传空字符串，表示明确要求创建新模板
+        # 为了区分"未指定"和"明确要求创建新"，当guide_id=""时传递特殊标记
+        effective_guide_id = final_guide_id if final_guide_id else (
+            "__CREATE_NEW__" if request.guide_id == "" else None
+        )
+        
+        one_click_request = OneClickGenerationRequest(
+            query=request.query,
+            project_name=request.project_name,
+            enable_review_and_regeneration=request.enable_review_and_regeneration,
+            guide_id=effective_guide_id
+        )
+        background_tasks.add_task(run_one_click_generation, task_id, one_click_request)
+        
+        logger.info(f"📝 新的智能生成任务: {task_id} - {request.query}")
+        
+        return SmartGenerationResponse(
+            status="generating",
+            message=f"文档生成任务已提交，任务ID: {task_id}",
+            task_id=task_id
+        )
 
 @app.post("/generate_document", response_model=DocumentGenerationResponse)
 async def generate_document_full(request: OneClickGenerationRequest, background_tasks: BackgroundTasks):
@@ -1234,6 +1364,7 @@ async def run_one_click_generation(task_id: str, request: OneClickGenerationRequ
             request.project_name,
             output_dir,
             request.enable_review_and_regeneration,
+            request.guide_id,
         )
 
         # 整理产物

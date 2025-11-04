@@ -128,7 +128,7 @@ class DocumentGenerationPipeline:
             'rate_delay': self.content_generator.get_rate_limit_delay()
         }
     
-    def generate_document(self, user_query: str, project_name: str, output_dir: str = "医灵古庙") -> Dict[str, str]:
+    def generate_document(self, user_query: str, project_name: str, output_dir: str = "医灵古庙", guide_id: Optional[str] = None) -> Dict[str, str]:
         """
         完整文档生成流程
         
@@ -136,6 +136,7 @@ class DocumentGenerationPipeline:
             user_query: 用户需求描述
             project_name: 项目名称，用于RAG检索
             output_dir: 输出目录
+            guide_id: 可选的模板ID，如果提供则使用指定模板
             
         Returns:
             Dict: 包含生成文件路径的字典
@@ -149,6 +150,8 @@ class DocumentGenerationPipeline:
         print("=" * 80)
         print(f"📝 用户需求：{user_query}")
         print(f"🏷️ 项目名称：{project_name}")
+        if guide_id:
+            print(f"📋 使用模板ID：{guide_id}")
         print("=" * 80)
         
         try:
@@ -156,7 +159,7 @@ class DocumentGenerationPipeline:
             print("\n🏗️  阶段1：生成文档结构和写作指导...")
             step1_start = time.time()
             
-            document_guide = self.orchestrator.generate_complete_guide(user_query)
+            document_guide = self.orchestrator.generate_complete_guide(user_query, guide_id=guide_id)
             
             step1_time = time.time() - step1_start
             def _count_sections_recursive(parts):
@@ -575,7 +578,7 @@ class DocumentGenerationPipeline:
             print("📄 返回初始生成结果")
             return initial_result
     
-    def generate_document_without_evaluation(self, user_query: str, project_name: str = "默认项目", output_dir: str = "outputs") -> Dict[str, str]:
+    def generate_document_without_evaluation(self, user_query: str, project_name: str = "默认项目", output_dir: str = "outputs", guide_id: Optional[str] = None) -> Dict[str, str]:
         """
         完整文档生成流程（不包含质量评估阶段）
         专为API服务器设计，跳过质量评估以提高响应速度
@@ -584,6 +587,7 @@ class DocumentGenerationPipeline:
             user_query: 用户需求描述
             project_name: 项目名称，用于RAG检索
             output_dir: 输出目录
+            guide_id: 可选的模板ID，如果提供则使用指定模板
             
         Returns:
             Dict: 包含生成文件路径的字典
@@ -597,6 +601,8 @@ class DocumentGenerationPipeline:
         print("=" * 80)
         print(f"📝 用户需求：{user_query}")
         print(f"🏷️ 项目名称：{project_name}")
+        if guide_id:
+            print(f"📋 使用模板ID：{guide_id}")
         print("=" * 80)
         
         try:
@@ -604,7 +610,7 @@ class DocumentGenerationPipeline:
             print("\n🏗️  阶段1：生成文档结构和写作指导...")
             step1_start = time.time()
             
-            document_guide = self.orchestrator.generate_complete_guide(user_query)
+            document_guide = self.orchestrator.generate_complete_guide(user_query, guide_id=guide_id)
             
             step1_time = time.time() - step1_start
             sections_count = sum(len(part.get('sections', [])) for part in document_guide.get('report_guide', []))

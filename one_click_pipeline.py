@@ -53,6 +53,7 @@ def one_click_generate_document(
     project_name: str = "默认项目",
     output_dir: str = "outputs",
     enable_review_and_regeneration: bool = True,
+    guide_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     一键执行端到端文档生成：结构→检索→成文（必选），评审→再生→合并（可选）。
@@ -62,6 +63,7 @@ def one_click_generate_document(
         project_name: 项目名（用于检索标识）
         output_dir: 输出目录（所有中间/最终文件将集中到此目录）
         enable_review_and_regeneration: 是否启用评审+再生+合并
+        guide_id: 可选的模板ID，如果提供则使用指定模板
 
     Returns:
         包含各阶段关键产物路径与统计信息的字典
@@ -87,7 +89,7 @@ def one_click_generate_document(
     }
 
     # 阶段1：结构 + 写作指导
-    guide = orchestrator.generate_complete_guide(user_query)
+    guide = orchestrator.generate_complete_guide(user_query, guide_id=guide_id)
     step1_path = os.path.join(output_dir, f"step1_document_guide_{timestamp}.json")
     with open(step1_path, "w", encoding="utf-8") as f:
         json.dump(guide, f, ensure_ascii=False, indent=2)

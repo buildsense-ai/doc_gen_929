@@ -428,11 +428,9 @@ class EnhancedMainDocumentGenerator:
 
             if generated_content:
                 content = self._format_content(generated_content)
-                #携带图片和表格
-                # content_with_media = self._append_tables_and_images(content, retrieved_table, retrieved_image)
-                # markdown_lines.append(content_with_media)
-                #不携带图片和表格
-                markdown_lines.append(content)
+                # 携带图片和表格
+                content_with_media = self._append_tables_and_images(content, retrieved_table, retrieved_image)
+                markdown_lines.append(content_with_media)
                 markdown_lines.append("")
             else:
                 # 仅在叶子节点缺少正文时显示占位符；非叶子节点跳过占位符

@@ -23,6 +23,12 @@ from clients.external_api_client import get_external_api_client
 from clients.web_search_client import get_web_search_client
 from config.settings import get_concurrency_manager, SmartConcurrencyManager
 
+# 导入 prompt 模板
+from Document_Agent.prompts import (
+    MULTI_DIMENSIONAL_QUERY_PROMPT,
+    WEB_SEARCH_QUERY_PROMPT
+)
+
 # ==============================================================================
 # 1. 数据结构与辅助类
 # ==============================================================================
@@ -73,8 +79,6 @@ class EnhancedReactAgent:
     def __init__(self, client: Any, concurrency_manager: SmartConcurrencyManager = None):
         self.client = client
         self.colored_logger = ColoredLogger(__name__)
-        self.max_iterations = 3
-        self.quality_threshold = 0.7
         
         # 使用外部API进行文档检索
         
@@ -100,14 +104,6 @@ class EnhancedReactAgent:
             'failed_queries': 0,
             'total_processing_time': 0.0,
             'avg_quality_score': 0.0
-        }
-        
-        self.query_strategies = {
-            'direct': "直接使用核心关键词搜索", 
-            'contextual': "结合写作指导上下文的详细查询", 
-            'semantic': "搜索与主题相关的语义概念", 
-            'specific': "搜索具体的案例、数据或技术标准",
-            'alternative': "使用同义词和相关概念进行发散搜索"
         }
         
         status_msg = f"智能速率控制: {'已启用' if self.has_smart_control else '传统模式'}"
@@ -259,38 +255,12 @@ class EnhancedReactAgent:
         # 获取项目名称，用于生成更精准的查询
         project_name = getattr(self, 'current_project_name', '')
         
-        prompt = f"""
-你是专业的报告编制专家，需要为特定项目的报告章节制定精准的资料检索计划。
-
-【项目信息】: {project_name}
-【目标章节】: {section_context['subtitle']}
-【写作要求】: {section_context['how_to_write']}
-
-【核心任务】: 深度分析写作要求，识别完成该章节写作的必备资料类型，生成精准的检索查询。
-
-【分析步骤】:
-1. 从写作要求中提取关键信息要素（数据、政策、标准、案例等）
-2. 结合项目特点确定检索的业务领域和范围
-3. 针对每类必备资料设计最有效的检索词组
-
-【查询生成原则】:
-1. 【紧扣写作要求】: 查询必须直接服务于写作要求中的具体内容
-2. 【项目特定性】: 结合项目名称中的关键信息（行业、地域、类型）
-3. 【资料导向】: 重点检索能直接用于写作的具体资料
-4. 【精准简洁】: 每个查询2-4个核心关键词，避免宽泛概念
-
-【输出要求】: 严格返回JSON数组，包含2-3个最关键的检索维度:
-[
-  {{"dimension": "资料类型描述", "query": "精准查询词组", "priority": "high/medium/low"}},
-  {{"dimension": "资料类型描述", "query": "精准查询词组", "priority": "high/medium/low"}}
-]
-
-【示例参考】:
-- 政策类资料: "职业教育法 实施细则" 
-- 标准类资料: "中职学校 建设标准"
-- 数据类资料: "清远市 教育统计"
-- 案例类资料: "职业教育基地 建设案例"
-"""
+        # 使用导入的 prompt 模板
+        prompt = MULTI_DIMENSIONAL_QUERY_PROMPT.format(
+            project_name=project_name,
+            subtitle=section_context['subtitle'],
+            how_to_write=section_context['how_to_write']
+        )
         
         try:
             response_str = self.client.generate(prompt)
@@ -392,33 +362,13 @@ class EnhancedReactAgent:
         # 获取项目名称，用于生成更精准的查询
         project_name = getattr(self, 'current_project_name', '')
         
-        prompt = f"""
-你是专业的报告编制专家，需要为当前报告章节生成精准的Web搜索查询。
-
-【项目名称】: {project_name}
-【目标章节】: {section_context['subtitle']}
-【写作要求】: {section_context['how_to_write']}
-【RAG已有内容】: {rag_summary}
-
-【核心任务】: 基于RAG检索结果的不足，生成1个精准的Web搜索查询来补充关键信息
-
-【查询生成原则】:
-1. 【主题聚焦】: 紧扣项目名称和章节主题，提取核心业务领域关键词
-2. 【内容互补】: 重点补充RAG缺失的信息（政策法规、标准规范、案例参考、最新数据）
-3. 【精准简洁】: 查询词控制在3-6个核心词汇，避免冗长拼接
-4. 【时效优先】: 优先获取最新的行业信息和政策动态
-
-【输出要求】: 
-- 只返回搜索查询词，用空格分隔
-- 长度限制：3-6个关键词
-- 必须贴合项目主题和章节内容
-- 不要任何解释或其他内容
-
-【查询构建逻辑】:
-1. 从项目名称中提取行业/领域关键词
-2. 结合章节要求确定信息类型（政策/标准/数据/案例）
-3. 生成简洁有效的搜索词组合
-"""
+        # 使用导入的 prompt 模板
+        prompt = WEB_SEARCH_QUERY_PROMPT.format(
+            project_name=project_name,
+            subtitle=section_context['subtitle'],
+            how_to_write=section_context['how_to_write'],
+            rag_summary=rag_summary
+        )
         
         try:
             response = self.client.generate(prompt)
@@ -448,66 +398,6 @@ class EnhancedReactAgent:
                 
         except Exception as e:
             self.colored_logger.error(f"分析RAG缺口失败: {e}，跳过Web搜索")
-            return None
-
-    def _perform_web_search_supplement(self, section_context: Dict[str, str], multi_queries: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-        """执行Web搜索补充"""
-        try:
-            # 生成Web搜索查询
-            web_query = self._generate_web_search_query(section_context, multi_queries)
-            if not web_query:
-                return []
-            
-            self.colored_logger.input_tool(f"🌐 Web搜索补充 | Query: {web_query}")
-            
-            # 执行Web搜索
-            search_results = self.web_search_client.search(
-                query=web_query,
-                engines=["serp"],
-                max_results=5  # 限制Web搜索结果数量
-            )
-            
-            if not search_results:
-                self.colored_logger.warning("🌐 Web搜索未返回结果")
-                return []
-            
-            # 格式化Web搜索结果
-            formatted_results = self.web_search_client.format_search_results(search_results)
-            
-            # 为Web搜索结果添加维度标记
-            for result in formatted_results:
-                result['dimension'] = 'web_supplement'
-                result['priority'] = 'medium'  # Web搜索结果作为补充，优先级中等
-            
-            return formatted_results
-            
-        except Exception as e:
-            self.colored_logger.error(f"❌ Web搜索补充失败: {e}")
-            return []
-    
-    def _generate_web_search_query(self, section_context: Dict[str, str], multi_queries: List[Dict[str, str]]) -> Optional[str]:
-        """生成Web搜索查询词"""
-        try:
-            # 提取章节标题的关键信息
-            subtitle = section_context.get('subtitle', '')
-            
-            # 构建Web搜索查询
-            # 优先使用最重要的维度查询
-            primary_queries = [q['query'] for q in multi_queries if q.get('priority') == 'high']
-            if not primary_queries:
-                primary_queries = [q['query'] for q in multi_queries[:1]]  # 取第一个查询
-            
-            if primary_queries:
-                # 结合章节标题和主要查询构建Web搜索词
-                web_query = f"{primary_queries[0]} {subtitle}".strip()
-                # 清理查询词，移除特殊字符
-                web_query = ' '.join(web_query.split())
-                return web_query[:100]  # 限制查询长度
-            
-            return None
-            
-        except Exception as e:
-            self.colored_logger.error(f"❌ 生成Web搜索查询失败: {e}")
             return None
 
     def _deduplicate_results(self, results: List[Dict], result_type: str) -> List[Dict]:
@@ -653,35 +543,6 @@ class EnhancedReactAgent:
         
         self.colored_logger.debug(f"🌐 Web结果去重: {len(results)} -> {len(deduplicated)}")
         return deduplicated
-
-    def _reason_and_act_for_section(self, section_context: Dict[str, str], state: ReActState) -> Optional[Dict[str, str]]:
-        """合并推理和行动阶段"""
-        used_strategies = {q.split(':')[0] for q in state.attempted_queries if ':' in q}
-        available_strategies = {k: v for k, v in self.query_strategies.items() if k not in used_strategies} or self.query_strategies
-        prompt = f"""
-作为一名专业的信息检索分析师，为报告章节制定检索计划。
-【目标章节】: {section_context['subtitle']}
-【写作指导】: {section_context['how_to_write']}
-【历史尝试】: 已尝试查询: {state.attempted_queries[-3:]}, 历史质量: {state.quality_scores[-3:]}
-【可用策略】: {json.dumps(available_strategies, ensure_ascii=False)}
-【任务】: 1.分析现状。2.选择一个最佳策略。3.生成3-5个关键词。
-【输出格式】: 必须严格返回以下JSON格式:
-{{
-  "analysis": "简要分析（100字内）",
-  "strategy": "选择的策略名称",
-  "keywords": "用逗号分隔的关键词"
-}}"""
-        try:
-            response_str = self.client.generate(prompt)
-            match = re.search(r'\{.*\}', response_str, re.DOTALL)
-            action_plan = json.loads(match.group(0))
-            if all(k in action_plan for k in ['analysis', 'strategy', 'keywords']):
-                return action_plan
-            self.colored_logger.error(f"LLM返回的JSON格式不完整: {action_plan}")
-            return None
-        except Exception as e:
-            self.colored_logger.error(f"推理与行动阶段出错: {e}")
-            return None
 
     def _observe_section_results(self, query: str, section_context: Dict[str, str], state: ReActState = None) -> List[Dict]:
         """观察阶段（使用外部API进行文档搜索）"""
@@ -854,89 +715,6 @@ class EnhancedReactAgent:
             return 'client_error'
         else:
             return 'unknown'
-
-    def _evaluate_section_results_quality(self, results: List[Dict], section_context: Dict[str, str], query: str) -> float:
-        """评估结果质量"""
-        if not results: return 0.0
-        
-        # 安全地处理内容，确保转换为字符串
-        def safe_content_str(result):
-            content = result.get('content', result)
-            if isinstance(content, (list, dict)):
-                return str(content)[:150]
-            return str(content)[:150]
-        
-        evaluation_prompt = f"""
-评估以下检索结果对章节写作的适用性：
-【目标章节】: {section_context['subtitle']}
-【写作指导】: {section_context['how_to_write']}
-【本次查询】: {query}
-【检索结果】: {chr(10).join(f"- {safe_content_str(r)}..." for r in results[:3])}
-【要求】: 综合评估后，只返回一个0.0到1.0的小数评分。"""
-        try:
-            response = self.client.generate(evaluation_prompt)
-            score_match = re.search(r'0?\.\d+|[01]', response)
-            return max(0.0, min(1.0, float(score_match.group()))) if score_match else 0.2
-        except Exception: return 0.1
-
-    def _evaluate_overall_rag_quality(self, all_results: List[Dict], section_context: Dict[str, str]) -> float:
-        """对所有RAG结果进行整体质量评估"""
-        if not all_results: 
-            return 0.0
-        
-        # 安全地处理内容，确保转换为字符串
-        def safe_content_str(result):
-            content = result.get('content', result)
-            if isinstance(content, (list, dict)):
-                return str(content)[:150]
-            return str(content)[:150]
-        
-        # 统计不同类型的结果
-        text_count = len([r for r in all_results if r.get('type') == 'text'])
-        image_count = len([r for r in all_results if r.get('type') == 'image'])
-        table_count = len([r for r in all_results if r.get('type') == 'table'])
-        
-        evaluation_prompt = f"""
-评估以下RAG检索结果对章节写作的整体适用性：
-
-【目标章节】: {section_context['subtitle']}
-【写作指导】: {section_context['how_to_write']}
-【检索结果统计】: 文本{text_count}条, 图片{image_count}条, 表格{table_count}条, 总计{len(all_results)}条
-【结果样本】: {chr(10).join(f"- {safe_content_str(r)}..." for r in all_results[:5])}
-
-【评估要求】: 
-1. 综合考虑结果的数量、质量、相关性和完整性
-2. 评估是否能支撑该章节的写作需求
-3. 只返回一个0.0到1.0的小数评分，不要其他内容
-
-评分标准：
-- 0.8-1.0: 结果丰富且高度相关，完全支撑写作
-- 0.6-0.8: 结果较好，基本支撑写作需求
-- 0.4-0.6: 结果一般，部分支撑写作
-- 0.0-0.4: 结果不足或相关性差
-"""
-        try:
-            response = self.client.generate(evaluation_prompt)
-            score_match = re.search(r'0?\.\d+|[01]', response)
-            quality_score = max(0.0, min(1.0, float(score_match.group()))) if score_match else 0.2
-            self.colored_logger.debug(f"📊 整体RAG质量评估: {quality_score:.3f}")
-            return quality_score
-        except Exception as e:
-            self.colored_logger.error(f"整体质量评估失败: {e}")
-            return 0.1
-
-    def _reflect(self, state: ReActState, current_quality: float) -> bool:
-        """反思阶段"""
-        if current_quality >= self.quality_threshold:
-            self.colored_logger.reflection(f"质量分 {current_quality:.2f} 达标, 停止。")
-            return False
-        if state.iteration >= self.max_iterations:
-            self.colored_logger.reflection(f"达到最大迭代次数, 停止。")
-            return False
-        if len(state.quality_scores) >= 2 and all(s < 0.3 for s in state.quality_scores[-2:]):
-            self.colored_logger.reflection("质量分持续过低, 提前停止。")
-            return False
-        return True
 
     def _synthesize_retrieved_results(self, section_context: Dict[str, str], state: ReActState) -> Dict[str, List]:
         """合成最终结果为三个分离的字段"""

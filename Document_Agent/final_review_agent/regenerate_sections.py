@@ -20,6 +20,9 @@ sys.path.append(project_root)
 
 from clients.openrouter_client import OpenRouterClient
 
+# 导入 prompt 模板
+from Document_Agent.prompts import SECTION_MODIFICATION_PROMPT
+
 class DocumentRegenerator:
     """
     文档重新生成器
@@ -168,28 +171,12 @@ class DocumentRegenerator:
         import time
         start_time = time.time()
         
-        prompt = f"""你是一位专业的文档编辑，请根据以下要求修改文档章节内容（仅正文）。
-
-【章节标题】：{section_title}
-
-【原始内容】：
-{original_content}
-
-【修改建议】：
-{suggestion}
-
-【修改要求】：
-1. 仅改写“正文”段落；严格忽略任何与图片/表格/媒体相关的内容。
-2. 绝对不要输出以下任何内容：
-   - “### 相关图片资料”或“相关图片资料”等标题或段落；
-   - 以“图片描述:”或“图片来源:”开头的行；
-   - 任意 Markdown 图片/链接（如 `![...](...)`、`[...](http...)` 等）；
-   - 任何表格（包括以“### 相关表格资料”为标题或以“|”开头的表格行）。
-3. 保持专业、客观、严谨的语言风格，确保逻辑清晰、结构合理，避免重复和冗余。
-4. 仅输出纯文本正文，不要包含任何Markdown标记、标题（如“#/##/### ...”）或媒体引用。
-5. 字数建议控制在800-1200字之间；段落之间用一个空行分隔。
-
-请直接输出修改后的“正文”内容，不要添加任何说明、标题或媒体相关信息："""
+        # 使用导入的 prompt 模板
+        prompt = SECTION_MODIFICATION_PROMPT.format(
+            section_title=section_title,
+            original_content=original_content,
+            suggestion=suggestion
+        )
         
         try:
             response = self.llm_client.generate(prompt)

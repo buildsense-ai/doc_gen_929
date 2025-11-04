@@ -28,6 +28,12 @@ sys.path.insert(0, project_root)
 from config.settings import get_concurrency_manager, SmartConcurrencyManager
 from clients.external_api_client import get_external_api_client
 
+# 导入 prompt 模板
+from Document_Agent.prompts import (
+    DOCUMENT_STRUCTURE_PROMPT,
+    WRITING_GUIDE_PROMPT
+)
+
 class EnhancedOrchestratorAgent:
     """编排代理 - 集成智能速率控制系统"""
 
@@ -84,6 +90,98 @@ class EnhancedOrchestratorAgent:
     def get_max_workers(self) -> int:
         """获取当前最大线程数"""
         return self.max_workers
+
+    def get_template_by_id(self, guide_id: str) -> Optional[Dict[str, Any]]:
+        """
+        根据模板ID获取文档模板 - 使用外部API
+        
+        Args:
+            guide_id: 模板ID
+            
+        Returns:
+            Optional[Dict[str, Any]]: 如果找到有效模板则返回模板结构，否则返回None
+        """
+        self.logger.info(f"🔍 根据ID获取文档模板 (使用外部API): {guide_id}...")
+        
+        try:
+            # 智能速率控制
+            if self.has_smart_control:
+                delay = self.rate_limiter.get_delay()
+                if delay > 0:
+                    self.logger.debug(f"智能延迟: {delay:.2f}秒")
+                    time.sleep(delay)
+            
+            # 记录API调用
+            api_start_time = time.time()
+            self.orchestration_stats['template_search_calls'] += 1
+            
+            # 使用外部API根据ID获取模板
+            template_result = self.external_api.get_template_by_id(guide_id)
+            
+            api_response_time = time.time() - api_start_time
+            
+            if not template_result:
+                self.logger.info(f"📭 外部API未找到模板: {guide_id}")
+                if self.has_smart_control:
+                    self.concurrency_manager.record_api_request(
+                        agent_name='orchestrator_agent',
+                        success=False,
+                        response_time=api_response_time,
+                        error_type='no_results'
+                    )
+                return None
+            
+            # 记录成功的API调用
+            if self.has_smart_control:
+                self.concurrency_manager.record_api_request(
+                    agent_name='orchestrator_agent',
+                    success=True,
+                    response_time=api_response_time
+                )
+            self.orchestration_stats['template_search_success'] += 1
+            
+            # 兼容新旧返回：新返回是 dict，含 content 与 template_id
+            if isinstance(template_result, dict):
+                template_content = template_result.get('content', '')
+                template_id = template_result.get('template_id')
+            else:
+                template_content = str(template_result)
+                template_id = guide_id
+
+            self.logger.info(f"📬 外部API返回模板内容，长度: {len(template_content)} 字符，template_id: {template_id}")
+            
+            # 尝试解析模板内容为文档结构
+            template = self._extract_template_from_api_response(template_content)
+            if template:
+                # 验证模板结构
+                try:
+                    self._validate_document_structure(template)
+                    self.logger.info("✅ 找到有效的文档结构模板！")
+                    # 将模板ID携带到结构中，便于下游落盘
+                    if template_id:
+                        template['template_id'] = template_id
+                    return template
+                except ValueError as e:
+                    self.logger.warning(f"⚠️ 模板结构验证失败: {e}")
+                return None
+            
+            self.logger.info("📭 外部API返回的内容不是有效的文档结构模板")
+            return None
+            
+        except Exception as e:
+            # 记录失败的API调用
+            api_response_time = time.time() - api_start_time if 'api_start_time' in locals() else 0
+            if self.has_smart_control:
+                error_type = self._classify_orchestrator_error(str(e))
+                self.concurrency_manager.record_api_request(
+                    agent_name='orchestrator_agent',
+                    success=False,
+                    response_time=api_response_time,
+                    error_type=error_type
+                )
+            
+            self.logger.error(f"❌ 根据ID获取模板时发生错误: {e}")
+            return None
 
     def query_existing_template(self, user_description: str) -> Optional[Dict[str, Any]]:
         """
@@ -180,17 +278,52 @@ class EnhancedOrchestratorAgent:
             self.logger.error(f"❌ 查询模板时发生错误: {e}")
             return None
 
-    def _extract_template_from_api_response(self, template_content: str) -> Optional[Dict[str, Any]]:
+    def _extract_template_from_api_response(self, template_content) -> Optional[Dict[str, Any]]:
         """
         从外部API响应中提取文档结构模板
         
         Args:
-            template_content: 外部API返回的模板内容
+            template_content: 外部API返回的模板内容（可能是字符串或dict）
             
         Returns:
             Optional[Dict[str, Any]]: 提取的模板结构，如果无效则返回None
         """
         try:
+            # 如果已经是 dict，处理可能的嵌套结构
+            if isinstance(template_content, dict):
+                self.logger.info(f"模板内容已经是字典格式，开始提取模板结构")
+                
+                # 情况1：包含 report_guide 字段
+                if 'report_guide' in template_content:
+                    report_guide_value = template_content['report_guide']
+                    
+                    # 情况1a：report_guide 直接是数组（标准格式）
+                    if isinstance(report_guide_value, list):
+                        self.logger.info(f"✅ 成功提取模板（标准格式），包含 {len(report_guide_value)} 个部分")
+                        return template_content
+                    
+                    # 情况1b：report_guide 是嵌套的字典，其中包含真正的 report_guide 数组
+                    elif isinstance(report_guide_value, dict) and 'report_guide' in report_guide_value:
+                        nested_report_guide = report_guide_value['report_guide']
+                        if isinstance(nested_report_guide, list):
+                            self.logger.info(f"✅ 成功提取模板（嵌套格式），包含 {len(nested_report_guide)} 个部分")
+                            # 返回规范化的结构
+                            return report_guide_value
+                        else:
+                            self.logger.warning(f"嵌套的 report_guide 不是数组: {type(nested_report_guide)}")
+                            return None
+                    else:
+                        self.logger.warning(f"report_guide 字段格式错误: {type(report_guide_value)}")
+                        return None
+                else:
+                    self.logger.warning("字典格式但缺少 'report_guide' 字段")
+                    return None
+            
+            # 如果是字符串，尝试解析
+            if not isinstance(template_content, str):
+                self.logger.warning(f"模板内容类型错误: {type(template_content)}")
+                return None
+            
             self.logger.info(f"正在解析外部API返回的模板内容，长度: {len(template_content)} 字符")
             
             # 首先尝试直接解析为JSON
@@ -439,60 +572,8 @@ class EnhancedOrchestratorAgent:
         self.logger.info(f"开始生成文档基础结构（智能速率控制增强版）... (最大重试: {max_retries}次)")
         structure_start_time = time.time()
         
-        base_prompt = """
-你是一个资深的专业文档结构设计专家。
-
-用户需求：{user_description}
-
-请为用户设计一个完整、专业的文档结构。你需要：
-1. 判断最适合的文档类型
-2. 设计合理的章节层级
-3. 确定每个章节和子章节的目标
-
-要求：
-- 结构完整、逻辑清晰
-- 体现项目特点和专业性
-- 章节设置要实用
-- 标题和子标题越多越好，尽可能详细和全面
-- 每个主要章节应包含多个子章节，覆盖所有相关方面
-- 必须按照指定的JSON格式返回
-- 返回纯文本格式，不要使用markdown语法
-
-请严格按照以下JSON格式返回：
-
-{{
-  "report_guide": [
-    {{
-      "title": "第一部分 章节标题",
-      "goal": "这个章节在整个文档中的作用和价值",
-      "sections": [
-        {{
-          "subtitle": "一、子章节标题"
-        }},
-        {{
-          "subtitle": "二、另一个子章节标题"
-        }}
-      ]
-    }},
-    {{
-      "title": "第二部分 另一个章节标题",
-      "goal": "另一个章节的目标",
-      "sections": [
-        {{
-          "subtitle": "一、子章节标题"
-        }}
-      ]
-    }}
-  ]
-}}
-
-注意：
-- 只返回JSON格式，不要其他解释
-- 不要包含how_to_write字段
-- title使用"第X部分"格式
-- subtitle使用"一、二、三、"格式
-- 专注于结构设计，不要写作指导内容
-"""
+        # 使用导入的 prompt 模板
+        base_prompt = DOCUMENT_STRUCTURE_PROMPT
         
         for attempt in range(max_retries):
             try:
@@ -837,49 +918,13 @@ class EnhancedOrchestratorAgent:
 
         subtitles_text = "\n".join(subtitles_list)
 
-        prompt = f"""
-你是一个专业文档写作指导专家。
-
-项目背景：{user_description}
-
-当前章节信息：
-- 章节标题：{section_title}
-- 章节目标：{section_goal}
-
-当前章节包含以下子章节：
-{subtitles_text}
-
-请为这个章节下的每个子章节提供简洁、实用的写作指导。对于每个子章节，告诉作者：
-1. 核心内容要点
-2. 关键信息要求  
-3. 写作注意事项
-
-要求：
-- 内容精炼，重点突出
-- 针对性强，贴合项目特点
-- 每个子章节的写作指导控制在100-200字内
-
-请严格按照以下JSON格式返回：
-
-{{
-  "writing_guides": [
-    {{
-      "subtitle": "一、第一个子章节标题",
-      "how_to_write": "详细的写作指导内容..."
-    }},
-    {{
-      "subtitle": "二、第二个子章节标题", 
-      "how_to_write": "详细的写作指导内容..."
-    }}
-  ]
-}}
-
-注意：
-- 只返回JSON格式，不要其他解释
-- 返回纯文本格式，不要使用markdown语法
-- 确保每个子章节都有对应的写作指导
-- 子章节标题要与输入完全一致
-"""
+        # 使用导入的 prompt 模板
+        prompt = WRITING_GUIDE_PROMPT.format(
+            user_description=user_description,
+            section_title=section_title,
+            section_goal=section_goal,
+            subtitles_text=subtitles_text
+        )
         
         max_retries = 3
         for attempt in range(max_retries):
@@ -1056,13 +1101,14 @@ class EnhancedOrchestratorAgent:
         
         return total_leaves > 0 and leaves_with_guides == total_leaves
 
-    def generate_complete_guide(self, user_description: str) -> Dict[str, Any]:
+    def generate_complete_guide(self, user_description: str, guide_id: Optional[str] = None) -> Dict[str, Any]:
         """
         完整流程：查询模板 -> 生成基础结构 -> 添加写作指导
         新增：优先查询现有模板，如果找到完整模板则直接返回，无需额外处理
         
         Args:
             user_description: 用户描述
+            guide_id: 可选的模板ID，如果提供则直接使用指定模板
             
         Returns:
             Dict: 完整的文档编写指导JSON
@@ -1070,8 +1116,24 @@ class EnhancedOrchestratorAgent:
         
         self.logger.info("🚀 开始生成完整的文档编写指导...")
         
-        # 🆕 新增步骤：查询现有模板
-        existing_template = self.query_existing_template(user_description)
+        existing_template = None
+        
+        # 🆕 处理模板获取逻辑
+        if guide_id == "__CREATE_NEW__":
+            # 特殊标记：明确要求创建新模板，不查询现有模板
+            self.logger.info("🆕 明确要求创建新模板，跳过模板查询")
+            existing_template = None
+        elif guide_id:
+            # 如果提供了具体的模板ID，根据ID获取模板
+            self.logger.info(f"📌 使用指定的模板ID: {guide_id}")
+            existing_template = self.get_template_by_id(guide_id)
+            
+            if not existing_template:
+                self.logger.error(f"❌ 无法获取指定的模板ID: {guide_id}")
+                raise ValueError(f"无法获取指定的模板ID: {guide_id}")
+        else:
+            # guide_id 为 None：原有逻辑，查询现有模板（保持旧接口兼容性）
+            existing_template = self.query_existing_template(user_description)
         
         if existing_template:
             self.logger.info("📋 找到现有模板，检查完整性...")

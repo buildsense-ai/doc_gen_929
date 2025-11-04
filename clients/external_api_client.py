@@ -164,6 +164,98 @@ class ExternalAPIClient:
             "mode": "api_client"
         }
     
+    def search_top3_templates(self, query: str, max_retries: int = 3) -> Optional[List[Dict[str, Any]]]:
+        """
+        搜索前3个推荐模板（同步版本，用于非异步环境）
+        
+        Args:
+            query: 搜索查询
+            max_retries: 最大重试次数
+            
+        Returns:
+            Optional[List[Dict[str, Any]]]: 
+                成功时返回包含3个模板的列表，每个模板包含：
+                - template_id: 模板ID
+                - template_name: 模板名称
+                - description: 模板描述
+                - score: 相关性分数
+                失败时返回 None
+        """
+        if not self.template_available:
+            self.logger.error("❌ 模板搜索服务不可用")
+            return None
+        
+        try:
+            # 检查是否已经在事件循环中
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 如果已经在运行中的事件循环，使用 run_coroutine_threadsafe 或者提示使用异步版本
+                self.logger.warning("⚠️ 检测到运行中的事件循环，请使用 search_top3_templates_async() 方法")
+                return None
+        except RuntimeError:
+            pass
+        
+        # 使用同步方式调用异步函数
+        return asyncio.run(self._search_top3_templates_async(query, max_retries))
+    
+    async def search_top3_templates_async(self, query: str, max_retries: int = 3) -> Optional[List[Dict[str, Any]]]:
+        """
+        搜索前3个推荐模板（异步版本，用于FastAPI等异步环境）
+        
+        Args:
+            query: 搜索查询
+            max_retries: 最大重试次数
+            
+        Returns:
+            Optional[List[Dict[str, Any]]]: 
+                成功时返回包含3个模板的列表，每个模板包含：
+                - template_id: 模板ID
+                - template_name: 模板名称
+                - description: 模板描述
+                - score: 相关性分数
+                失败时返回 None
+        """
+        if not self.template_available:
+            self.logger.error("❌ 模板搜索服务不可用")
+            return None
+        
+        return await self._search_top3_templates_async(query, max_retries)
+    
+    async def _search_top3_templates_async(self, query: str, max_retries: int = 3) -> Optional[List[Dict[str, Any]]]:
+        """异步搜索前3个推荐模板"""
+        try:
+            self.logger.info(f"🔍 API搜索前3个推荐模板: {query}")
+            start_time = time.time()
+            
+            # 构造请求数据
+            request_data = {"query": query, "top_k": 3}
+            
+            # 调用API
+            response = await self._make_api_request(self.template_api_url, "/search_top3_templates", request_data, max_retries)
+            
+            if response is None:
+                self.logger.error("❌ 搜索前3个模板API调用失败")
+                return None
+            
+            # 检查响应格式
+            if response.get("success"):
+                templates = response.get("data", [])
+                
+                if not templates or not isinstance(templates, list):
+                    self.logger.info(f"📭 未找到推荐模板")
+                    return None
+                
+                response_time = time.time() - start_time
+                self.logger.info(f"✅ 搜索前3个模板成功: 耗时 {response_time:.2f}s, 找到 {len(templates)} 个模板")
+                return templates
+            else:
+                self.logger.error(f"❌ API返回失败: {response.get('message', '未知错误')}")
+                return None
+            
+        except Exception as e:
+            self.logger.error(f"❌ 搜索前3个模板失败: {e}")
+            return None
+    
     def template_search(self, query: str, max_retries: int = 3) -> Optional[Any]:
         """
         模板搜索
@@ -231,6 +323,73 @@ class ExternalAPIClient:
             
         except Exception as e:
             self.logger.error(f"❌ 模板搜索失败: {e}")
+            return None
+    
+    def get_template_by_id(self, guide_id: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """
+        根据模板ID获取模板
+        
+        Args:
+            guide_id: 模板ID
+            max_retries: 最大重试次数
+            
+        Returns:
+            Optional[Dict[str, Any]]: 模板内容，失败时返回None
+        """
+        if not self.template_available:
+            self.logger.error("❌ 模板服务不可用")
+            return None
+        
+        # 使用同步方式调用异步函数
+        return asyncio.run(self._get_template_by_id_async(guide_id, max_retries))
+    
+    async def _get_template_by_id_async(self, guide_id: str, max_retries: int = 3) -> Optional[Dict[str, Any]]:
+        """异步根据ID获取模板"""
+        try:
+            self.logger.info(f"🔍 根据ID获取模板: {guide_id}")
+            start_time = time.time()
+            
+            url = f"{self.template_api_url}/template/{guide_id}"
+            
+            for attempt in range(max_retries):
+                try:
+                    timeout = aiohttp.ClientTimeout(total=self.timeout)
+                    async with aiohttp.ClientSession(timeout=timeout) as session:
+                        async with session.get(url) as response:
+                            if response.status == 200:
+                                result = await response.json()
+                                response_time = time.time() - start_time
+                                
+                                if result.get("success"):
+                                    template_content = result.get("data", "")
+                                    self.logger.info(f"✅ 获取模板成功: 耗时 {response_time:.2f}s, 模板ID: {guide_id}")
+                                    return {"content": template_content, "template_id": guide_id, "raw": result}
+                                else:
+                                    self.logger.error(f"❌ 获取模板失败: {result.get('message', '未知错误')}")
+                                    return None
+                            elif response.status == 404:
+                                self.logger.error(f"❌ 模板不存在: {guide_id}")
+                                return None
+                            else:
+                                error_text = await response.text()
+                                self.logger.error(f"❌ 获取模板失败 (状态码: {response.status}): {error_text}")
+                                if attempt < max_retries - 1:
+                                    await asyncio.sleep(1 * (attempt + 1))
+                                continue
+                                
+                except asyncio.TimeoutError:
+                    self.logger.error(f"❌ 获取模板超时 (尝试 {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1 * (attempt + 1))
+                except Exception as e:
+                    self.logger.error(f"❌ 获取模板异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(1 * (attempt + 1))
+            
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"❌ 获取模板失败: {e}")
             return None
     
     def document_search(self, query: str, project_name: str) -> Optional[Dict[str, List]]:
