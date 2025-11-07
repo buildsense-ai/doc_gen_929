@@ -207,10 +207,10 @@ def _wrapped_generate_without_eval(task_id: str, query: str, project_name: str, 
     finally:
         _thread_task_map.pop(threading.get_ident(), None)
 
-def _wrapped_one_click(task_id: str, query: str, project_name: str, output_dir: str, enable_review_and_regeneration: bool, guide_id: Optional[str] = None):
+def _wrapped_one_click(task_id: str, query: str, project_name: str, output_dir: str, enable_review_and_regeneration: bool, guide_id: Optional[str] = None, project_id: Optional[str] = None):
     try:
         _thread_task_map[threading.get_ident()] = task_id
-        return one_click_generate_document(query, project_name, output_dir, enable_review_and_regeneration, guide_id=guide_id)
+        return one_click_generate_document(query, project_name, output_dir, enable_review_and_regeneration, guide_id=guide_id, project_id=project_id)
     finally:
         _thread_task_map.pop(threading.get_ident(), None)
 
@@ -1375,6 +1375,7 @@ async def run_one_click_generation(task_id: str, request: OneClickGenerationRequ
             output_dir,
             request.enable_review_and_regeneration,
             request.guide_id,
+            request.project_id,
         )
 
         # 整理产物
@@ -1709,6 +1710,114 @@ class FieldSearchResponse(BaseModel):
 #             },
 #             processing_time=processing_time
 #         )
+
+# ===== 模板管理接口 =====
+
+class TemplateQueryRequest(BaseModel):
+    """模板查询请求模型"""
+    project_id: Optional[str] = Field(None, description="项目ID（可选，用于过滤）")
+    keyword: Optional[str] = Field(None, description="搜索关键词（可选）")
+    limit: int = Field(10, ge=1, le=100, description="返回数量限制")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "project_id": "proj_123456",
+                "keyword": "用户手册",
+                "limit": 10
+            }
+        }
+
+class TemplateResponse(BaseModel):
+    """模板响应模型"""
+    success: bool
+    message: str
+    data: Optional[Any] = None
+
+@app.get("/templates/{guide_id}", response_model=TemplateResponse)
+async def get_template(guide_id: str):
+    """
+    根据模板ID获取模板详情
+    """
+    try:
+        from clients.template_db_client import get_template_db_client
+        
+        db_client = get_template_db_client()
+        template = db_client.get_template_by_id(guide_id)
+        
+        if template:
+            return TemplateResponse(
+                success=True,
+                message=f"成功获取模板: {guide_id}",
+                data=template
+            )
+        else:
+            raise HTTPException(status_code=404, detail=f"模板不存在: {guide_id}")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"❌ 获取模板失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取模板失败: {str(e)}")
+
+@app.post("/templates/search", response_model=TemplateResponse)
+async def search_templates(request: TemplateQueryRequest):
+    """
+    搜索模板
+    支持按项目ID、关键词搜索
+    """
+    try:
+        from clients.template_db_client import get_template_db_client
+        
+        db_client = get_template_db_client()
+        templates = db_client.search_templates(
+            keyword=request.keyword,
+            project_id=request.project_id,
+            limit=request.limit
+        )
+        
+        return TemplateResponse(
+            success=True,
+            message=f"成功找到 {len(templates)} 个模板",
+            data={
+                "templates": templates,
+                "count": len(templates),
+                "query": {
+                    "project_id": request.project_id,
+                    "keyword": request.keyword,
+                    "limit": request.limit
+                }
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ 搜索模板失败: {e}")
+        raise HTTPException(status_code=500, detail=f"搜索模板失败: {str(e)}")
+
+@app.get("/templates/project/{project_id}", response_model=TemplateResponse)
+async def get_project_templates(project_id: str, limit: int = 10):
+    """
+    获取指定项目的所有模板
+    """
+    try:
+        from clients.template_db_client import get_template_db_client
+        
+        db_client = get_template_db_client()
+        templates = db_client.get_templates_by_project(project_id, limit=limit)
+        
+        return TemplateResponse(
+            success=True,
+            message=f"成功获取项目 {project_id} 的模板",
+            data={
+                "templates": templates,
+                "count": len(templates),
+                "project_id": project_id
+            }
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ 获取项目模板失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取项目模板失败: {str(e)}")
 
 # ===== 启动服务器 =====
 

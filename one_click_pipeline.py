@@ -20,12 +20,16 @@ from typing import Dict, Any, Optional
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 from clients.openrouter_client import OpenRouterClient
+from clients.template_db_client import get_template_db_client
 from Document_Agent.orchestrator_agent import OrchestratorAgent
 from Document_Agent.section_writer_agent import ReactAgent
 from Document_Agent.content_generator_agent import MainDocumentGenerator
 from Document_Agent.final_review_agent.document_reviewer import DocumentReviewer
 from Document_Agent.final_review_agent.regenerate_sections import DocumentRegenerator
 from Document_Agent.final_review_agent.json_merger import JSONDocumentMerger
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 def _ensure_dir(path: str) -> None:
@@ -54,6 +58,7 @@ def one_click_generate_document(
     output_dir: str = "outputs",
     enable_review_and_regeneration: bool = True,
     guide_id: Optional[str] = None,
+    project_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     一键执行端到端文档生成：结构→检索→成文（必选），评审→再生→合并（可选）。
@@ -64,6 +69,7 @@ def one_click_generate_document(
         output_dir: 输出目录（所有中间/最终文件将集中到此目录）
         enable_review_and_regeneration: 是否启用评审+再生+合并
         guide_id: 可选的模板ID，如果提供则使用指定模板
+        project_id: 项目ID（可选），用于保存模板到数据库
 
     Returns:
         包含各阶段关键产物路径与统计信息的字典
@@ -94,6 +100,55 @@ def one_click_generate_document(
     with open(step1_path, "w", encoding="utf-8") as f:
         json.dump(guide, f, ensure_ascii=False, indent=2)
     results["stages"]["structure_and_guides"] = {"file": step1_path}
+    
+    # 💾 如果是新建模板（没有指定 guide_id 或指定了 __CREATE_NEW__），保存到数据库
+    is_new_template = (guide_id is None or guide_id == "__CREATE_NEW__")
+    if is_new_template and guide:
+        try:
+            db_client = get_template_db_client()
+            
+            # 从 guide 中提取信息
+            template_id = guide.get("guide_id", f"guide_{timestamp}")
+            template_name = guide.get("report_title", user_query[:100])  # 使用报告标题或用户查询
+            
+            # 生成模板摘要（取前200个字符）
+            guide_summary = f"根据需求'{user_query}'自动生成的模板"
+            if "sections" in guide:
+                section_count = len(guide.get("sections", []))
+                guide_summary += f"，包含 {section_count} 个章节"
+            
+            # 保存模板到数据库
+            success = db_client.save_template(
+                guide_id=template_id,
+                template_name=template_name,
+                report_guide=guide,
+                guide_summary=guide_summary,
+                project_id=project_id
+            )
+            
+            if success:
+                logger.info(f"✅ 新建模板已保存到数据库: {template_id}")
+                results["template_saved"] = {
+                    "guide_id": template_id,
+                    "template_name": template_name,
+                    "project_id": project_id
+                }
+            else:
+                logger.warning(f"⚠️ 模板保存失败: {template_id}")
+                
+        except Exception as e:
+            # 模板保存失败不影响主流程
+            logger.error(f"❌ 保存模板到数据库时出错: {e}")
+            logger.info("⚠️ 模板保存失败，但文档生成将继续...")
+    
+    # 如果使用了已有模板，增加使用频率
+    elif guide_id and guide_id != "__CREATE_NEW__":
+        try:
+            db_client = get_template_db_client()
+            db_client.increment_usage(guide_id)
+            logger.info(f"✅ 模板使用次数+1: {guide_id}")
+        except Exception as e:
+            logger.warning(f"⚠️ 更新模板使用频率失败: {e}")
 
     # 阶段2：检索增强
     enriched = section_writer.process_report_guide(guide, project_name)
