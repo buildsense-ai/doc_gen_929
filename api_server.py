@@ -860,6 +860,7 @@ async def smart_generate_document(request: SmartGenerationRequest, background_ta
         one_click_request = OneClickGenerationRequest(
             query=request.query,
             project_name=request.project_name,
+            project_id=request.project_id,  # ✅ 传递 project_id
             enable_review_and_regeneration=request.enable_review_and_regeneration,
             guide_id=effective_guide_id
         )
