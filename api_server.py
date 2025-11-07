@@ -402,6 +402,7 @@ class OneClickGenerationRequest(BaseModel):
     """一键串联工作流请求模型（结构→检索→成文→评审→再生→合并）"""
     query: str = Field(..., description="文档生成需求描述", min_length=1, max_length=2000)
     project_name: str = Field(..., description="项目名称，用于RAG检索", min_length=1, max_length=100)
+    project_id: Optional[str] = Field(None, description="项目ID（可选），用于关联项目")
     enable_review_and_regeneration: bool = Field(default=False, description="是否启用评审+再生+合并")
     guide_id: Optional[str] = Field(None, description="可选的模板ID，如果提供则使用指定模板")
 
@@ -410,6 +411,7 @@ class OneClickGenerationRequest(BaseModel):
             "example": {
                 "query": "我想生成一个关于医灵古庙的文物影响评估报告",
                 "project_name": "医灵古庙",
+                "project_id": "proj_123456",
                 "enable_review_and_regeneration": False,
                 "guide_id": None
             }
@@ -419,6 +421,7 @@ class SmartGenerationRequest(BaseModel):
     """智能文档生成请求模型（支持模板推荐、指定模板、创建新模板三种模式）"""
     query: str = Field(..., description="文档生成需求描述", min_length=1, max_length=2000)
     project_name: str = Field(..., description="项目名称，用于RAG检索", min_length=1, max_length=100)
+    project_id: Optional[str] = Field(None, description="项目ID（可选），用于关联项目")
     enable_review_and_regeneration: bool = Field(default=False, description="是否启用评审+再生+合并")
     guide_id: Optional[str] = Field(None, description="模板控制参数：'__SUGGEST__'=推荐模板，具体ID=使用指定模板，None/''=创建新模板")
     
@@ -427,6 +430,7 @@ class SmartGenerationRequest(BaseModel):
             "example": {
                 "query": "我想生成一个关于医灵古庙的文物影响评估报告",
                 "project_name": "医灵古庙",
+                "project_id": "proj_123456",
                 "enable_review_and_regeneration": False,
                 "guide_id": "__SUGGEST__"
             }
@@ -840,6 +844,7 @@ async def smart_generate_document(request: SmartGenerationRequest, background_ta
             "created_at": datetime.now(),
             "updated_at": datetime.now(),
             "request": request.dict(),
+            "project_id": request.project_id,  # 单独存储 project_id 便于快速访问
             "result": None,
             "error": None
         }
@@ -860,7 +865,8 @@ async def smart_generate_document(request: SmartGenerationRequest, background_ta
         )
         background_tasks.add_task(run_one_click_generation, task_id, one_click_request)
         
-        logger.info(f"📝 新的智能生成任务: {task_id} - {request.query}")
+        project_info = f" [项目ID: {request.project_id}]" if request.project_id else ""
+        logger.info(f"📝 新的智能生成任务: {task_id} - {request.query}{project_info}")
         
         return SmartGenerationResponse(
             status="generating",
@@ -884,6 +890,7 @@ async def generate_document_full(request: OneClickGenerationRequest, background_
         "created_at": datetime.now(),
         "updated_at": datetime.now(),
         "request": request.dict(),
+        "project_id": request.project_id,  # 单独存储 project_id 便于快速访问
         "result": None,
         "error": None
     }
@@ -892,7 +899,8 @@ async def generate_document_full(request: OneClickGenerationRequest, background_
     # 添加后台任务
     background_tasks.add_task(run_one_click_generation, task_id, request)
 
-    logger.info(f"📝 新的完整工作流任务: {task_id} - {request.query}")
+    project_info = f" [项目ID: {request.project_id}]" if request.project_id else ""
+    logger.info(f"📝 新的完整工作流任务: {task_id} - {request.query}{project_info}")
 
     return DocumentGenerationResponse(
         task_id=task_id,
@@ -916,6 +924,7 @@ async def generate_document_stream(request: OneClickGenerationRequest):
         "created_at": datetime.now(),
         "updated_at": datetime.now(),
         "request": request.dict(),
+        "project_id": request.project_id,  # 单独存储 project_id 便于快速访问
         "result": None,
         "error": None
     }
@@ -958,7 +967,8 @@ async def generate_document_stream(request: OneClickGenerationRequest):
                 "message": "任务已创建，开始推送日志",
                 "task_id": task_id,
                 "query": request.query,
-                "project_name": request.project_name
+                "project_name": request.project_name,
+                "project_id": request.project_id
             }
             yield f"data: {json.dumps(init_evt, ensure_ascii=False)}\n\n"
 
