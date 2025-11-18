@@ -151,7 +151,11 @@ class EnhancedReactAgent:
         # 并行仅用于顶层sections，子层级在各自任务中递归串行处理，降低任务调度开销
         tasks = []
         for part in result_data.get('report_guide', []):
-            part_context = {'title': part.get('title', ''), 'goal': part.get('goal', '')}
+            part_context = {
+                'title': part.get('title', ''), 
+                'goal': part.get('goal', ''),
+                'current_summary': part.get('current_summary', '')  # 添加累积摘要支持
+            }
             for section in part.get('sections', []):
                 tasks.append((section, part_context, [part_context.get('title', '')]))
 
@@ -196,7 +200,8 @@ class EnhancedReactAgent:
         state = ReActState()
         section_context = {
             'subtitle': subtitle, 'how_to_write': section_data.get('how_to_write', ''),
-            'part_title': part_context.get('title', ''), 'part_goal': part_context.get('goal', '')
+            'part_title': part_context.get('title', ''), 'part_goal': part_context.get('goal', ''),
+            'current_summary': part_context.get('current_summary', '')  # 传递累积摘要
         }
         retrieved_content = self._react_loop_for_section(section_context, state)
         self.colored_logger.section_complete(subtitle, state.iteration, max(state.quality_scores) if state.quality_scores else 0)
@@ -255,11 +260,17 @@ class EnhancedReactAgent:
         # 获取项目名称，用于生成更精准的查询
         project_name = getattr(self, 'current_project_name', '')
         
+        # 获取累积摘要（如果有的话）
+        current_summary = section_context.get('current_summary', '')
+        if not current_summary:
+            current_summary = "无前文内容"
+        
         # 使用导入的 prompt 模板
         prompt = MULTI_DIMENSIONAL_QUERY_PROMPT.format(
             project_name=project_name,
             subtitle=section_context['subtitle'],
-            how_to_write=section_context['how_to_write']
+            how_to_write=section_context['how_to_write'],
+            current_summary=current_summary
         )
         
         try:

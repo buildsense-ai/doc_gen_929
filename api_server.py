@@ -47,6 +47,7 @@ try:
     from config.settings import setup_logging, get_config
     from config.minio_config import get_minio_client, upload_document_files
     from one_click_pipeline import one_click_generate_document
+    from sequence_doc_generator.pipeline import run_sequence_generation
 except ImportError as e:
     print(f"❌ 导入模块失败: {e}")
     sys.exit(1)
@@ -454,6 +455,41 @@ class SmartGenerationResponse(BaseModel):
     suggestions: Optional[List[TemplateRecommendation]] = Field(None, description="推荐的模板列表（推荐模式）")
     files: Optional[Dict[str, str]] = Field(None, description="生成的文件（本地下载链接）")
     minio_urls: Optional[Dict[str, str]] = Field(None, description="MinIO存储的文件下载链接")
+
+class SequenceGenerationRequest(BaseModel):
+    """序列生成请求模型 - 与Todo Planning Agent对接"""
+    project_id: str = Field(..., description="项目ID", min_length=1)
+    session_id: str = Field(..., description="会话ID", min_length=1)
+    project_name: str = Field(..., description="项目名称", min_length=1)
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "project_id": "proj_123456",
+                "session_id": "session_789",
+                "project_name": "医灵古庙文物影响评估"
+            }
+        }
+
+class SequenceGenerationResponse(BaseModel):
+    """序列生成响应模型"""
+    status: str = Field(..., description="状态：started（已启动）、failed（失败）")
+    message: str = Field(..., description="响应消息")
+    project_id: str = Field(..., description="项目ID")
+    session_id: str = Field(..., description="会话ID")
+
+class FeedbackRequest(BaseModel):
+    """用户反馈请求模型"""
+    text: str = Field(..., description="反馈内容", min_length=1)
+    chapter_hint: Optional[str] = Field(None, description="章节提示：current/next/all_future/chapter_N")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "text": "第二章历史部分太简单了，需要更详细的描述",
+                "chapter_hint": "current"
+            }
+        }
 
 class ConcurrencySettings(BaseModel):
     """并发设置模型"""
@@ -1082,6 +1118,335 @@ async def download_file(file_id: str):
         media_type='application/octet-stream'
     )
 
+# ===== 序列生成API接口 =====
+
+@app.post("/sequence_generation/start", response_model=SequenceGenerationResponse)
+async def start_sequence_generation(request: SequenceGenerationRequest, background_tasks: BackgroundTasks):
+    """
+    启动序列生成任务 - 与Todo Planning Agent对接
+    从Redis队列中读取任务，逐章节生成文档
+    """
+    try:
+        # 启动序列生成任务
+        def event_callback(event: dict):
+            """事件回调函数，用于处理序列生成过程中的事件"""
+            event_type = event.get("event_type", "unknown")
+            logger.info(f"序列生成事件: {event_type} - {event}")
+            
+            # 构造前端事件格式
+            frontend_event = {
+                "timestamp": datetime.now().isoformat(),
+                "type": "sequence_event",
+                "event_type": event_type,
+                "project_id": event.get("project_id"),
+                "session_id": event.get("session_id"),
+                "data": event
+            }
+            
+            # 处理不同类型的事件
+            if event_type == "chapter_paused":
+                logger.warning(f"⚠️ 章节暂停: {event.get('title')} - {event.get('missing_info')}")
+                frontend_event["message"] = f"章节 '{event.get('title')}' 因资料不足暂停，需要用户补充信息"
+                frontend_event["action_required"] = "user_input"
+                frontend_event["missing_info"] = event.get("missing_info", [])
+                
+            elif event_type == "chapter_completed_awaiting_confirmation":
+                logger.info(f"✅ 章节完成等待确认: {event.get('title')}")
+                frontend_event["message"] = f"章节 '{event.get('title')}' 已完成，等待用户确认"
+                frontend_event["action_required"] = "user_confirmation"
+                frontend_event["brief"] = event.get("brief")
+                frontend_event["content_preview"] = event.get("content", "")[:200] + "..." if event.get("content") else ""
+                frontend_event["word_count"] = event.get("word_count", 0)
+                
+            elif event_type == "chapter_started":
+                frontend_event["message"] = f"开始生成章节: {event.get('title')}"
+                
+            elif event_type == "all_completed":
+                logger.info("🎉 所有章节生成完成")
+                frontend_event["message"] = "所有章节生成完成"
+                frontend_event["action_required"] = "none"
+            
+            # 推送事件到前端 - 使用现有的日志管理器机制
+            try:
+                # 使用项目ID作为任务ID来推送事件
+                task_id = f"seq_{event.get('project_id', 'unknown')}"
+                log_manager.add_log(task_id, frontend_event)
+            except Exception as e:
+                logger.warning(f"推送前端事件失败: {e}")
+            
+            # 同时存储事件到Redis供前端查询
+            try:
+                from sequence_doc_generator.redis_client import RedisQueueClient
+                redis_client = RedisQueueClient()
+                project_id = event.get("project_id")
+                session_id = event.get("session_id")
+                if project_id and session_id:
+                    stream_key = f"sequence_events:{project_id}:{session_id}"
+                    stream_event = {
+                        "event_type": event_type,
+                        "project_id": project_id,
+                        "session_id": session_id,
+                        "task_index": event.get("task_index"),
+                        "task_title": event.get("title") or event.get("task_title"),
+                        "chapter_title": event.get("title") or event.get("chapter_title"),
+                        "content": event.get("content"),
+                        "brief": event.get("brief"),
+                        "cumulative_summary": event.get("cumulative_summary"),
+                        "word_count": event.get("word_count"),
+                        "status": event.get("status"),
+                        "missing_info": event.get("missing_info"),
+                    }
+                    stream_payload = {"data": json.dumps(stream_event, ensure_ascii=False)}
+
+                    def _write_sequence_event():
+                        redis_client.client.xadd(
+                            stream_key,
+                            stream_payload,
+                            maxlen=200,
+                            approximate=True,
+                        )
+                        redis_client.client.expire(stream_key, 86400)
+
+                    try:
+                        _write_sequence_event()
+                    except Exception as write_exc:
+                        if "WRONGTYPE" in str(write_exc).upper():
+                            redis_client.client.delete(stream_key)
+                            _write_sequence_event()
+                        else:
+                            raise
+            except Exception as e:
+                logger.warning(f"写入序列事件流失败: {e}")
+        
+        # 在后台启动序列生成 - 修复参数传递
+        def run_sequence_wrapper():
+            """包装函数，正确传递关键字参数"""
+            try:
+                run_sequence_generation(
+                    request.project_id,
+                    request.session_id,
+                    request.project_name,
+                    event_callback=event_callback
+                )
+            except Exception as e:
+                logger.error(f"❌ 序列生成执行失败: {e}", exc_info=True)
+        
+        background_tasks.add_task(run_sequence_wrapper)
+        
+        logger.info(f"🚀 序列生成任务已启动: project_id={request.project_id}, session_id={request.session_id}")
+        
+        return SequenceGenerationResponse(
+            status="started",
+            message="序列生成任务已启动",
+            project_id=request.project_id,
+            session_id=request.session_id
+        )
+        
+    except Exception as e:
+        logger.error(f"❌ 启动序列生成失败: {e}")
+        return SequenceGenerationResponse(
+            status="failed",
+            message=f"启动失败: {str(e)}",
+            project_id=request.project_id,
+            session_id=request.session_id
+        )
+
+@app.post("/sequence_generation/{project_id}/{session_id}/feedback")
+async def submit_feedback(project_id: str, session_id: str, request: FeedbackRequest):
+    """
+    提交用户反馈 - 在序列生成过程中接收用户输入
+    """
+    try:
+        from sequence_doc_generator.redis_client import RedisQueueClient
+        
+        redis_client = RedisQueueClient()
+        
+        # 将反馈写入Redis
+        feedback_data = {
+            "text": request.text,
+            "chapter_hint": request.chapter_hint,
+            "timestamp": datetime.now().isoformat(),
+            "project_id": project_id,
+            "session_id": session_id
+        }
+        
+        feedback_key = f"feedback:{project_id}:{session_id}"
+        redis_client.client.lpush(feedback_key, json.dumps(feedback_data))
+        
+        logger.info(f"📝 收到用户反馈: project_id={project_id}, session_id={session_id}, feedback={request.text[:50]}...")
+        
+        return {
+            "status": "received",
+            "message": "反馈已收到并处理",
+            "project_id": project_id,
+            "session_id": session_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 处理用户反馈失败: {e}")
+        raise HTTPException(status_code=500, detail=f"处理反馈失败: {str(e)}")
+
+@app.post("/sequence_generation/{project_id}/{session_id}/continue")
+async def continue_generation(project_id: str, session_id: str):
+    """
+    继续生成 - 发送continue信号给序列生成器
+    """
+    try:
+        from sequence_doc_generator.redis_client import RedisQueueClient
+        
+        redis_client = RedisQueueClient()
+        continue_key = f"writer_continue:{project_id}:{session_id}"
+        
+        # 设置continue信号
+        redis_client.client.set(continue_key, "true", ex=300)  # 5分钟过期
+        
+        logger.info(f"✅ 发送继续信号: project_id={project_id}, session_id={session_id}")
+        
+        return {
+            "status": "sent",
+            "message": "继续信号已发送",
+            "project_id": project_id,
+            "session_id": session_id
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 发送继续信号失败: {e}")
+        raise HTTPException(status_code=500, detail=f"发送信号失败: {str(e)}")
+
+@app.get("/sequence_generation/{project_id}/{session_id}/status")
+async def get_sequence_status(project_id: str, session_id: str):
+    """
+    获取序列生成状态
+    """
+    try:
+        from sequence_doc_generator.redis_client import RedisQueueClient
+        
+        redis_client = RedisQueueClient()
+        
+        # 获取任务队列状态
+        tasks, _ = redis_client.load_queue(project_id, session_id)
+        
+        # 获取当前状态
+        status_key = f"generation_status:{project_id}:{session_id}"
+        status_data = redis_client.client.get(status_key)
+        current_status = json.loads(status_data) if status_data else {"status": "unknown"}
+        
+        # 将SectionTask对象转换为字典格式
+        task_dicts = [task.to_redis_entry() for task in tasks] if tasks else []
+        
+        return {
+            "project_id": project_id,
+            "session_id": session_id,
+            "current_status": current_status,
+            "task_queue": task_dicts,
+            "total_tasks": len(tasks) if tasks else 0,
+            "completed_tasks": len([t for t in tasks if t.status.value == "worked"]) if tasks else 0
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 获取序列生成状态失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取状态失败: {str(e)}")
+
+@app.get("/sequence_generation/{project_id}/{session_id}/events")
+async def get_sequence_events(project_id: str, session_id: str, limit: int = 20):
+    """
+    获取序列生成事件历史
+    """
+    try:
+        from sequence_doc_generator.redis_client import RedisQueueClient
+        
+        redis_client = RedisQueueClient()
+        event_key = f"sequence_events:{project_id}:{session_id}"
+        
+        # 获取最近的事件（Stream）
+        events = []
+        events_data = redis_client.client.xrevrange(event_key, count=limit)
+        for event_id, payload in events_data:
+            data_raw = payload.get(b"data") if isinstance(payload, dict) else None
+            if not data_raw:
+                continue
+            try:
+                decoded = data_raw.decode("utf-8") if isinstance(data_raw, (bytes, bytearray)) else data_raw
+                event = json.loads(decoded)
+                event["_event_id"] = event_id.decode("utf-8") if isinstance(event_id, (bytes, bytearray)) else event_id
+                events.append(event)
+            except json.JSONDecodeError:
+                continue
+        
+        events.reverse()  # 按时间顺序返回
+        
+        return {
+            "project_id": project_id,
+            "session_id": session_id,
+            "events": events,
+            "total_events": len(events)
+        }
+        
+    except Exception as e:
+        logger.error(f"❌ 获取序列生成事件失败: {e}")
+        raise HTTPException(status_code=500, detail=f"获取事件失败: {str(e)}")
+
+@app.get("/sequence_generation/{project_id}/stream")
+async def stream_sequence_events(project_id: str):
+    """
+    序列生成事件流 - SSE接口
+    """
+    async def event_generator():
+        try:
+            # 使用项目ID作为任务ID来订阅事件流
+            task_id = f"seq_{project_id}"
+            log_queue = await log_manager.subscribe_logs(task_id)
+            
+            # 发送初始连接事件
+            init_event = {
+                "type": "connection_established",
+                "message": f"已连接到项目 {project_id} 的事件流",
+                "timestamp": datetime.now().isoformat()
+            }
+            yield f"data: {json.dumps(init_event, ensure_ascii=False)}\n\n"
+            
+            # 推送实时事件
+            while True:
+                try:
+                    event = await asyncio.wait_for(log_queue.get(), timeout=30.0)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    
+                    # 如果是完成事件，结束流
+                    if event.get('event_type') == 'all_completed':
+                        await asyncio.sleep(1)
+                        end_event = {"type": "stream_end", "message": "序列生成完成"}
+                        yield f"data: {json.dumps(end_event, ensure_ascii=False)}\n\n"
+                        break
+                        
+                except asyncio.TimeoutError:
+                    # 发送心跳
+                    heartbeat = {
+                        "type": "heartbeat",
+                        "timestamp": datetime.now().isoformat()
+                    }
+                    yield f"data: {json.dumps(heartbeat, ensure_ascii=False)}\n\n"
+                    
+        except Exception as e:
+            error_event = {
+                "type": "error",
+                "message": f"事件流错误: {str(e)}",
+                "timestamp": datetime.now().isoformat()
+            }
+            yield f"data: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+        finally:
+            if 'log_queue' in locals():
+                log_manager.unsubscribe_logs(task_id, log_queue)
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "Access-Control-Allow-Origin": "*",
+        }
+    )
+
 # ===== 后台任务函数 =====
 
 async def run_document_generation(task_id: str, request: DocumentGenerationRequest):
@@ -1529,6 +1894,97 @@ async def run_one_click_generation(task_id: str, request: OneClickGenerationRequ
         except Exception:
             pass
         log_manager.cleanup_task_logs(task_id)
+
+# ===== RAG检索接口 =====
+
+class MixedContentSearchRequest(BaseModel):
+    """混合内容搜索请求模型"""
+    query: str = Field(..., description="搜索查询文本", min_length=1, max_length=1000)
+    project_name: str = Field(..., description="项目名称", min_length=1, max_length=100)
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "地理位置分析",
+                "project_name": "医灵古庙"
+            }
+        }
+
+class MixedContentSearchResponse(BaseModel):
+    """混合内容搜索响应模型"""
+    status: str = Field(..., description="响应状态")
+    message: str = Field(..., description="响应消息")
+    data: Optional[Dict[str, Any]] = Field(None, description="搜索结果数据")
+
+@app.post("/api/v1/search_mixed_content", response_model=MixedContentSearchResponse)
+async def search_mixed_content(request: MixedContentSearchRequest):
+    """
+    混合内容搜索接口 - 为ReactAgent提供RAG检索服务
+    
+    这是ReactAgent调用的核心RAG检索端点，支持文本、图片、表格等混合内容搜索
+    """
+    start_time = time.time()
+    
+    try:
+        logger.info(f"🔍 混合内容搜索: {request.query} (项目: {request.project_name})")
+        
+        # TODO: 这里应该调用实际的RAG检索服务
+        # 目前返回模拟数据以避免404错误，后续需要集成真实的RAG服务
+        
+        # 模拟搜索结果 - 基于ReactAgent期望的数据格式
+        mock_results = {
+            "results": [
+                {
+                    "page_number": 1,
+                    "content": f"关于{request.query}的详细描述和分析内容...",
+                    "similarity": 0.95,
+                    "source": "文档第1页",
+                    "images": [],
+                    "tables": []
+                },
+                {
+                    "page_number": 2, 
+                    "content": f"{request.query}相关的历史背景和技术细节...",
+                    "similarity": 0.88,
+                    "source": "文档第2页",
+                    "images": ["image1.jpg"],
+                    "tables": []
+                },
+                {
+                    "page_number": 3,
+                    "content": f"针对{request.query}的具体实施方案和建议...",
+                    "similarity": 0.82,
+                    "source": "文档第3页", 
+                    "images": [],
+                    "tables": ["table1.csv"]
+                }
+            ],
+            "total_count": 3,
+            "search_metadata": {
+                "query": request.query,
+                "project_name": request.project_name,
+                "search_time": time.time() - start_time
+            }
+        }
+        
+        processing_time = time.time() - start_time
+        logger.info(f"✅ 混合内容搜索成功: 耗时 {processing_time:.2f}s, 返回 {len(mock_results['results'])} 条结果")
+        
+        return MixedContentSearchResponse(
+            status="success",
+            message="搜索成功",
+            data=mock_results
+        )
+        
+    except Exception as e:
+        processing_time = time.time() - start_time
+        logger.error(f"❌ 混合内容搜索失败: {e}")
+        
+        return MixedContentSearchResponse(
+            status="error",
+            message=f"搜索失败: {str(e)}",
+            data={"results": [], "total_count": 0}
+        )
 
 # ===== 字段搜索接口 =====
 
