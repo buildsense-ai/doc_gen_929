@@ -30,7 +30,7 @@ os.environ['CHROMA_TELEMETRY_DISABLED'] = 'True'
 # 添加项目路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
-from fastapi import FastAPI, HTTPException, BackgroundTasks, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, status, APIRouter
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -73,6 +73,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+internal_router = APIRouter(prefix="/internal", tags=["internal"])
 
 # 全局变量
 pipeline: Optional[DocumentGenerationPipeline] = None
@@ -1251,6 +1253,44 @@ async def start_sequence_generation(request: SequenceGenerationRequest, backgrou
             session_id=request.session_id
         )
 
+@internal_router.post("/trigger_continue/{project_id}/{session_id}")
+async def trigger_continue_signal(project_id: str, session_id: str):
+    """
+    接收8000的主动通知，立即唤醒等待中的Writer。
+    """
+    try:
+        from sequence_doc_generator.redis_client import (
+            RedisQueueClient,
+            set_internal_continue_signal,
+        )
+
+        redis_client = RedisQueueClient()
+        logger.info("📥 收到外部continue通知: %s/%s", project_id, session_id)
+
+        if redis_client.check_writer_continue_signal(project_id, session_id):
+            set_internal_continue_signal(project_id, session_id)
+            logger.info("✅ 已确认Redis信号并设置内部continue标志")
+            return {
+                "success": True,
+                "message": "continue信号已确认",
+                "project_id": project_id,
+                "session_id": session_id,
+            }
+
+        logger.warning("⚠️ Redis中没有找到continue信号: %s/%s", project_id, session_id)
+        return {
+            "success": False,
+            "message": "Redis中没有continue信号",
+            "project_id": project_id,
+            "session_id": session_id,
+        }
+    except Exception as e:
+        logger.error(f"❌ 处理trigger_continue失败: {e}")
+        raise HTTPException(status_code=500, detail=f"trigger_continue失败: {str(e)}")
+
+
+app.include_router(internal_router)
+
 @app.post("/sequence_generation/{project_id}/{session_id}/feedback")
 async def submit_feedback(project_id: str, session_id: str, request: FeedbackRequest):
     """
@@ -1292,13 +1332,18 @@ async def continue_generation(project_id: str, session_id: str):
     继续生成 - 发送continue信号给序列生成器
     """
     try:
-        from sequence_doc_generator.redis_client import RedisQueueClient
+        from sequence_doc_generator.redis_client import (
+            RedisQueueClient,
+            set_internal_continue_signal,
+        )
         
         redis_client = RedisQueueClient()
         continue_key = f"writer_continue:{project_id}:{session_id}"
         
         # 设置continue信号
         redis_client.client.set(continue_key, "true", ex=300)  # 5分钟过期
+        # 同步设置内部continue标志，避免等待轮询
+        set_internal_continue_signal(project_id, session_id)
         
         logger.info(f"✅ 发送继续信号: project_id={project_id}, session_id={session_id}")
         

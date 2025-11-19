@@ -20,6 +20,32 @@ from .models import (
 
 LOGGER = logging.getLogger(__name__)
 
+# ----------------------------------------------------------------------
+# Local continue signal registry (used for HTTP-trigger fast paths)
+# ----------------------------------------------------------------------
+_INTERNAL_CONTINUE_SIGNALS: Dict[str, bool] = {}
+
+
+def _internal_continue_key(project_id: str, session_id: str) -> str:
+    return f"{project_id}:{session_id}"
+
+
+def set_internal_continue_signal(project_id: str, session_id: str) -> None:
+    """Mark that an external notification has confirmed the continue signal."""
+    _INTERNAL_CONTINUE_SIGNALS[_internal_continue_key(project_id, session_id)] = True
+
+
+def pop_internal_continue_signal(project_id: str, session_id: str) -> bool:
+    """Return True once if an internal continue signal was registered."""
+    key = _internal_continue_key(project_id, session_id)
+    return _INTERNAL_CONTINUE_SIGNALS.pop(key, False)
+
+
+def has_internal_continue_signal(project_id: str, session_id: str) -> bool:
+    """Check whether an internal continue signal is pending."""
+    key = _internal_continue_key(project_id, session_id)
+    return _INTERNAL_CONTINUE_SIGNALS.get(key, False)
+
 
 def _build_redis_client() -> redis.Redis:
     return redis.Redis(
@@ -92,6 +118,11 @@ class RedisQueueClient:
         key = writer_continue_key(project_id, session_id)
         self.client.set(key, "true", ex=600)
 
+    def check_writer_continue_signal(self, project_id: str, session_id: str) -> bool:
+        """Non-destructively check whether the continue signal exists."""
+        key = writer_continue_key(project_id, session_id)
+        return bool(self.client.get(key))
+
     def wait_for_continue_signal(
         self,
         project_id: str,
@@ -103,6 +134,12 @@ class RedisQueueClient:
         key = writer_continue_key(project_id, session_id)
         start = time.time()
         while time.time() - start < timeout_seconds:
+            if pop_internal_continue_signal(project_id, session_id):
+                LOGGER.debug(
+                    "通过内部HTTP通知收到continue信号: %s/%s", project_id, session_id
+                )
+                self.client.delete(key)
+                return True
             value = self.client.get(key)
             if value:
                 self.client.delete(key)
