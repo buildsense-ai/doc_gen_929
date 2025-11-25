@@ -101,10 +101,37 @@ class SequenceGenerationRunner:
                         LOGGER.warning("等待用户反馈超时，序列生成暂停")
                         break
                 else:
-                    self._emit_event(
-                        "all_completed", project_id=project_id, session_id=session_id
-                    )
-                    break
+                    # ✅ 严格检查：重新加载队列并确认所有任务真的都完成了
+                    tasks, _ = self.redis.load_queue(project_id, session_id)
+                    
+                    # 统计各状态任务数量
+                    status_counts = {
+                        "waiting": sum(1 for t in tasks if t.status == TaskStatus.WAITING),
+                        "working": sum(1 for t in tasks if t.status == TaskStatus.WORKING),
+                        "worked": sum(1 for t in tasks if t.status == TaskStatus.WORKED),
+                        "paused": sum(1 for t in tasks if t.status == TaskStatus.PAUSED),
+                    }
+                    
+                    LOGGER.info(f"📊 检查完成状态: 总数={len(tasks)}, waiting={status_counts['waiting']}, working={status_counts['working']}, worked={status_counts['worked']}, paused={status_counts['paused']}")
+                    
+                    # 检查是否还有未完成的任务（WAITING 或 WORKING）
+                    unfinished = status_counts["waiting"] + status_counts["working"]
+                    if unfinished > 0:
+                        LOGGER.warning(f"⚠️ 仍有 {unfinished} 个任务未完成，继续等待...")
+                        time.sleep(2)  # 等待2秒后重新检查
+                        continue
+                    
+                    # 确保所有任务都是 WORKED 状态才发送 all_completed
+                    if status_counts["worked"] == len(tasks):
+                        LOGGER.info(f"✅ 所有 {len(tasks)} 个任务已完成，发送 all_completed 事件")
+                        self._emit_event(
+                            "all_completed", project_id=project_id, session_id=session_id
+                        )
+                        break
+                    else:
+                        LOGGER.warning(f"⚠️ 任务状态异常，继续等待... (状态分布: {status_counts})")
+                        time.sleep(2)
+                        continue
 
             # 获取当前累积摘要
             cumulative_summary = self.redis.get_cumulative_summary(project_id, session_id)
