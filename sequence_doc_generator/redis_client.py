@@ -96,7 +96,20 @@ class RedisQueueClient:
         task: SectionTask,
     ) -> None:
         key = queue_key(project_id, session_id)
-        self.client.lset(key, queue_index, task.to_json())
+        try:
+            self.client.lset(key, queue_index, task.to_json())
+        except redis.exceptions.ResponseError as e:
+            if "index out of range" in str(e):
+                # 重新加载队列并查找任务
+                LOGGER.warning(f"⚠️ 索引 {queue_index} 无效，尝试重新定位任务 {task.index}")
+                tasks, _ = self.load_queue(project_id, session_id)
+                for idx, t in enumerate(tasks):
+                    if t.index == task.index:
+                        LOGGER.info(f"✅ 重新定位成功: 任务{task.index} -> 队列位置{idx}")
+                        self.client.lset(key, idx, task.to_json())
+                        return
+                LOGGER.error(f"❌ 无法找到任务 {task.index} 在队列中")
+            raise
 
     # ------------------------------------------------------------------
     # Generation state + signals
