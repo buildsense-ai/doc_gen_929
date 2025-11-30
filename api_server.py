@@ -1263,6 +1263,7 @@ async def trigger_continue_signal(project_id: str, session_id: str):
             RedisQueueClient,
             set_internal_continue_signal,
         )
+        from sequence_doc_generator.models import queue_key
 
         redis_client = RedisQueueClient()
         logger.info("📥 收到外部continue通知: %s/%s", project_id, session_id)
@@ -1278,12 +1279,88 @@ async def trigger_continue_signal(project_id: str, session_id: str):
             }
 
         logger.warning("⚠️ Redis中没有找到continue信号: %s/%s", project_id, session_id)
-        return {
-            "success": False,
-            "message": "Redis中没有continue信号",
-            "project_id": project_id,
-            "session_id": session_id,
-        }
+        
+        # 🆕 智能检测：主动检查是否所有任务都完成了
+        try:
+            tasks, _ = redis_client.load_queue(project_id, session_id)
+            
+            if not tasks:
+                logger.info(f"ℹ️ 队列为空，可能已清理")
+                return {
+                    "success": False,
+                    "message": "Queue is empty",
+                    "status": "no_queue"
+                }
+            
+            # 检查是否所有任务都是worked状态
+            from sequence_doc_generator.models import TaskStatus
+            worked_count = sum(1 for t in tasks if t.status == TaskStatus.WORKED)
+            total = len(tasks)
+            all_worked = worked_count == total
+            
+            logger.info(f"📊 队列状态检查: {worked_count}/{total} worked")
+            
+            if all_worked:
+                logger.info(f"🎉 检测到所有 {total} 个任务已完成，立即发送all_completed事件")
+                
+                # 🔥 直接发送all_completed事件到Redis Stream
+                stream_key = f"sequence_events:{project_id}:{session_id}"
+                stream_event = {
+                    "event_type": "all_completed",
+                    "project_id": project_id,
+                    "session_id": session_id,
+                    "triggered_by": "smart_detection"  # 标记来源
+                }
+                stream_payload = {"data": json.dumps(stream_event, ensure_ascii=False)}
+                
+                try:
+                    redis_client.client.xadd(stream_key, stream_payload, maxlen=200, approximate=True)
+                    redis_client.client.expire(stream_key, 86400)
+                    logger.info(f"✅ 已发送all_completed事件到Stream")
+                    
+                    return {
+                        "success": True,
+                        "message": f"All {total} tasks completed, sent all_completed event",
+                        "status": "all_completed_sent",
+                        "worked_count": worked_count,
+                        "total": total
+                    }
+                except Exception as stream_exc:
+                    logger.error(f"❌ 发送all_completed事件失败: {stream_exc}")
+                    return {
+                        "success": False,
+                        "message": f"Failed to send event: {str(stream_exc)}",
+                        "status": "completed_detected_but_send_failed"
+                    }
+            else:
+                # 统计各状态任务数量
+                waiting = sum(1 for t in tasks if t.status == TaskStatus.WAITING)
+                working = sum(1 for t in tasks if t.status == TaskStatus.WORKING)
+                paused = sum(1 for t in tasks if t.status == TaskStatus.PAUSED)
+                
+                logger.info(f"ℹ️ 任务尚未全部完成: waiting={waiting}, working={working}, paused={paused}, worked={worked_count}")
+                return {
+                    "success": False,
+                    "message": f"Not all tasks completed: {worked_count}/{total} worked",
+                    "status": "waiting",
+                    "stats": {
+                        "waiting": waiting,
+                        "working": working,
+                        "paused": paused,
+                        "worked": worked_count,
+                        "total": total
+                    }
+                }
+        except Exception as check_exc:
+            logger.error(f"❌ 检查队列状态失败: {check_exc}")
+            import traceback
+            traceback.print_exc()
+            return {
+                "success": False,
+                "message": f"Queue check failed: {str(check_exc)}",
+                "status": "error"
+            }
+            
     except Exception as e:
         logger.error(f"❌ 处理trigger_continue失败: {e}")
         raise HTTPException(status_code=500, detail=f"trigger_continue失败: {str(e)}")
