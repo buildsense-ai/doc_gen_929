@@ -43,7 +43,7 @@ class ExternalAPIClient:
         
         # API服务器配置
         self.template_api_url = os.getenv("TEMPLATE_API_URL", "http://43.139.19.144:8003")
-        self.rag_api_url = os.getenv("RAG_API_URL", "http://43.139.19.144:8001")
+        self.rag_api_url = os.getenv("RAG_API_URL", "http://43.139.19.144:1234")
         self.timeout = int(os.getenv("API_TIMEOUT", "30"))
         self.skip_health_check = os.getenv("SKIP_HEALTH_CHECK", "false").lower() == "true"
         
@@ -81,12 +81,27 @@ class ExternalAPIClient:
                 self.template_available = True
                 self.logger.info("🔄 假设模板搜索服务可用，将在调用时验证")
             
-            # 检查RAG检索服务
+            # 检查RAG检索服务（使用轻量级POST请求）
             try:
-                response = requests.options(f"{self.rag_api_url}/api/v1/search_mixed_content", timeout=10)
-                if response.status_code in [200, 405, 404]:
+                test_data = {
+                    "query": "health_check",
+                    "project_id": "test",
+                    "top_k": 1,
+                    "use_refine": False,
+                    "use_graph_expansion": False
+                }
+                response = requests.post(
+                    f"{self.rag_api_url}/search", 
+                    json=test_data,
+                    timeout=10
+                )
+                if response.status_code == 200:
                     self.document_available = True
                     self.logger.info("✅ RAG检索服务可达")
+                else:
+                    self.logger.warning(f"⚠️ RAG检索服务响应异常: {response.status_code}")
+                    self.document_available = True
+                    self.logger.info("🔄 假设RAG检索服务可用，将在调用时验证")
             except Exception as e:
                 self.logger.warning(f"⚠️ RAG检索服务检查失败: {e}")
                 # 即使检查失败，也假设服务可用
@@ -114,6 +129,8 @@ class ExternalAPIClient:
             Optional[dict]: API响应，失败时返回None
         """
         url = f"{base_url}{endpoint}"
+        self.logger.debug(f"🔗 请求URL: {url}")
+        self.logger.debug(f"📦 请求数据: {data}")
         
         for attempt in range(max_retries):
             try:
@@ -124,7 +141,7 @@ class ExternalAPIClient:
                             return await response.json()
                         else:
                             error_text = await response.text()
-                            self.logger.error(f"❌ API请求失败 (状态码: {response.status}): {error_text}")
+                            self.logger.error(f"❌ API请求失败 (URL: {url}, 状态码: {response.status}): {error_text}")
                             if attempt < max_retries - 1:
                                 await asyncio.sleep(1 * (attempt + 1))  # 指数退避
                             continue
@@ -158,7 +175,7 @@ class ExternalAPIClient:
                 },
                 "document_search": {
                     "available": self.document_available,
-                    "endpoint": "/api/v1/search_mixed_content"
+                    "endpoint": "/search"
                 }
             },
             "mode": "api_client"
@@ -394,54 +411,128 @@ class ExternalAPIClient:
     
     def document_search(self, query: str, project_name: str) -> Optional[Dict[str, List]]:
         """
-        RAG检索搜索
+        RAG检索搜索（三级并行检索 + Bundle聚合）
+        
+        使用新的Bundle架构进行检索：
+        - 并行检索三个层级：Conversations、Facts、Topics
+        - 构建关系图并找出连通分量
+        - 返回多个Bundles（每个Bundle包含相关的conversations, facts, topics）
         
         Args:
             query: 搜索查询
-            project_name: 项目名称
+            project_name: 项目名称（作为project_id）
             
         Returns:
-            Optional[Dict[str, List]]: 搜索结果，失败时返回None
+            Optional[Dict[str, List]]: 包含bundles、short_term_memory、recent_turns的搜索结果，失败时返回None
         """
         if not self.document_available:
             self.logger.error("❌ RAG检索服务不可用")
             return None
         
-        # 使用同步方式调用异步函数
-        return asyncio.run(self._document_search_async(query, project_name))
+        # 尝试获取现有事件循环，如果没有则创建新的
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # 如果循环正在运行，使用同步requests库代替
+                import requests
+                return self._document_search_sync(query, project_name)
+            else:
+                return loop.run_until_complete(self._document_search_async(query, project_name))
+        except RuntimeError:
+            # 没有事件循环，创建新的
+            return asyncio.run(self._document_search_async(query, project_name))
+    
+    def _document_search_sync(self, query: str, project_name: str, 
+                             max_retries: int = 3) -> Optional[Dict[str, List]]:
+        """同步RAG检索搜索（使用requests库）"""
+        try:
+            import requests
+            
+            self.logger.info(f"📄 RAG检索搜索(同步): {query} (项目: {project_name})")
+            start_time = time.time()
+            
+            # 构造请求数据
+            request_data = {
+                "query": query,
+                "project_id": project_name,
+                "top_k": 5,
+                "use_refine": False,
+                "use_graph_expansion": False
+            }
+            
+            url = f"{self.rag_api_url}/search"
+            self.logger.debug(f"🔗 请求URL: {url}")
+            self.logger.debug(f"📦 请求数据: {request_data}")
+            
+            # 发送POST请求
+            for attempt in range(max_retries):
+                try:
+                    response = requests.post(url, json=request_data, timeout=self.timeout)
+                    
+                    if response.status_code == 200:
+                        result = response.json()
+                        response_time = time.time() - start_time
+                        
+                        bundles = result.get("bundles", [])
+                        total_bundles = result.get("total_bundles", 0)
+                        
+                        self.logger.info(f"✅ RAG检索成功: 耗时 {response_time:.2f}s, 获得 {total_bundles} 个Bundles")
+                        return result
+                    else:
+                        error_text = response.text
+                        self.logger.error(f"❌ API请求失败 (URL: {url}, 状态码: {response.status_code}): {error_text}")
+                        if attempt < max_retries - 1:
+                            time.sleep(1 * (attempt + 1))
+                        continue
+                        
+                except requests.exceptions.Timeout:
+                    self.logger.error(f"❌ API请求超时 (尝试 {attempt + 1}/{max_retries})")
+                    if attempt < max_retries - 1:
+                        time.sleep(1 * (attempt + 1))
+                except Exception as e:
+                    self.logger.error(f"❌ API请求异常 (尝试 {attempt + 1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        time.sleep(1 * (attempt + 1))
+            
+            self.logger.error("❌ RAG检索API调用失败（所有重试已用尽）")
+            return None
+            
+        except Exception as e:
+            self.logger.error(f"❌ RAG检索失败: {e}")
+            return None
     
     async def _document_search_async(self, query: str, project_name: str, 
                                    max_retries: int = 3) -> Optional[Dict[str, List]]:
-        """异步RAG检索搜索"""
+        """异步RAG检索搜索（使用三级并行检索 + Bundle聚合）"""
         try:
-            self.logger.info(f"📄 RAG检索搜索: {query} (项目: {project_name})")
+            self.logger.info(f"📄 RAG检索搜索(异步): {query} (项目: {project_name})")
             start_time = time.time()
             
-            # 构造请求数据 - 只传递query和project_name
+            # 构造请求数据 - 使用新API格式
             request_data = {
                 "query": query,
-                "project_name": project_name
+                "project_id": project_name,  # 使用project_id而不是project_name
+                "top_k": 5,
+                "use_refine": False,
+                "use_graph_expansion": False
             }
             
-            # 调用RAG检索API
-            response = await self._make_api_request(self.rag_api_url, "/api/v1/search_mixed_content", request_data, max_retries)
+            # 调用RAG检索API（新端点：/search）
+            response = await self._make_api_request(self.rag_api_url, "/search", request_data, max_retries)
             
             if response is None:
                 self.logger.error("❌ RAG检索API调用失败")
                 return None
             
-            # 检查响应状态
-            if response.get("status") != "success":
-                error_msg = response.get("message", "搜索失败")
-                self.logger.error(f"❌ RAG检索失败: {error_msg}")
-                return None
-            
             response_time = time.time() - start_time
             
-            # 直接返回API响应，让react_agent处理新格式
-            # 这样react_agent可以直接使用response.get('data', {}).get('results', [])
-            self.logger.info(f"✅ RAG检索成功: 耗时 {response_time:.2f}s")
+            # 新API返回格式包含 bundles, short_term_memory, recent_turns等
+            bundles = response.get("bundles", [])
+            total_bundles = response.get("total_bundles", 0)
             
+            self.logger.info(f"✅ RAG检索成功: 耗时 {response_time:.2f}s, 获得 {total_bundles} 个Bundles")
+            
+            # 返回完整响应供后续处理
             return response
             
         except Exception as e:

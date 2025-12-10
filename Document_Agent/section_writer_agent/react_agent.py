@@ -590,83 +590,91 @@ class EnhancedReactAgent:
             api_response_time = time.time() - api_start_time
             
             if search_results:
-                # 处理混合内容搜索API返回结果
+                # 处理Bundle格式的搜索结果
                 all_results = []
                 
-                # 获取搜索结果数组
-                results_data = search_results.get('data', {}).get('results', [])
-                self.colored_logger.debug(f"🔍 混合内容搜索结果数量: {len(results_data)}")
+                # 获取Bundles
+                bundles = search_results.get('bundles', [])
+                total_bundles = search_results.get('total_bundles', 0)
+                self.colored_logger.debug(f"🔍 Bundle搜索结果数量: {total_bundles}")
                 
-                for item in results_data:
-                    page_number = item.get('page_number', 'N/A')
-                    content = item.get('content', '')
-                    images = item.get('images', [])
-                    similarity = item.get('similarity', 0.0)
-                    rerank_score = item.get('rerank_score', 0.0)
-                    mixed_score = item.get('mixed_score', 0.0)
-                    source_type = item.get('source_type', 'unknown')
+                # 解析每个Bundle
+                for bundle in bundles:
+                    bundle_id = bundle.get('bundle_id', 0)
                     
-                    self.colored_logger.debug(f"📄 处理第{page_number}页，类型: {source_type}，混合分数: {mixed_score:.3f}")
+                    # 处理conversations（对话内容）
+                    conversations = bundle.get('conversations', [])
+                    for conv in conversations:
+                        text_content = conv.get('text', '')
+                        if text_content:
+                            all_results.append({
+                                'content': text_content,
+                                'source': f"Bundle {bundle_id} - Conversation {conv.get('conversation_id', '')} (分数: {conv.get('score', 0):.3f})",
+                                'type': 'text',
+                                'score': conv.get('score', 0.0),
+                                'page_number': f'Bundle {bundle_id}',
+                                'metadata': conv.get('metadata', {})
+                            })
                     
-                    # 根据source_type确定内容类型
-                    if source_type == 'page_text':
-                        # 文本内容
-                        all_results.append({
-                            'content': f"{content}",
-                            'source': f"第{page_number}页文本 (混合分数: {mixed_score:.3f})",
-                            'type': 'text',
-                            'score': mixed_score,
-                            'page_number': page_number,
-                            'similarity': similarity,
-                            'rerank_score': rerank_score
-                        })
+                    # 处理facts（事实内容）
+                    facts = bundle.get('facts', [])
+                    for fact in facts:
+                        fact_content = fact.get('content', '')
+                        if fact_content:
+                            all_results.append({
+                                'content': fact_content,
+                                'source': f"Bundle {bundle_id} - Fact {fact.get('fact_id', '')} (分数: {fact.get('score', 0):.3f})",
+                                'type': 'text',
+                                'score': fact.get('score', 0.0),
+                                'page_number': f'Bundle {bundle_id}',
+                                'metadata': fact.get('metadata', {})
+                            })
                         
-                        # 处理该页面包含的图片
-                        for image_url in images:
-                            clean_url = image_url.strip().strip('`').strip()
-                            if clean_url:
-                                all_results.append({
-                                    'content': f"[第{page_number}页] 图片",
-                                    'source': f"第{page_number}页图片 (混合分数: {mixed_score:.3f})",
-                                    'type': 'image',
-                                    'score': mixed_score,
-                                    'page_number': page_number,
-                                    'path': clean_url,
-                                    'description': f"第{page_number}页图片"
-                                })
+                        # 如果fact包含图片
+                        image_url = fact.get('image_url', '')
+                        if image_url:
+                            all_results.append({
+                                'content': f"图片: {fact_content[:50] if fact_content else 'Fact图片'}",
+                                'source': f"Bundle {bundle_id} - Fact图片 (分数: {fact.get('score', 0):.3f})",
+                                'type': 'image',
+                                'score': fact.get('score', 0.0),
+                                'page_number': f'Bundle {bundle_id}',
+                                'path': image_url,
+                                'description': fact_content,
+                                'detailed_description': fact_content
+                            })
                     
-                    elif source_type == 'detailed_description':
-                        # 图片描述内容
-                        for image_url in images:
-                            clean_url = image_url.strip().strip('`').strip()
-                            if clean_url:
-                                all_results.append({
-                                    'content': f"图片描述: {content}",
-                                    'source': f"第{page_number}页图片描述 (混合分数: {mixed_score:.3f})",
-                                    'type': 'image',
-                                    'score': mixed_score,
-                                    'page_number': page_number,
-                                    'path': clean_url,
-                                    'description': content,
-                                    'detailed_description': content,
-                                    'similarity': similarity,
-                                    'rerank_score': rerank_score
-                                })
-                    
-                    else:
-                        # 其他类型内容，作为通用处理
+                    # 处理topics（主题内容）
+                    topics = bundle.get('topics', [])
+                    for topic in topics:
+                        topic_title = topic.get('title', '')
+                        topic_summary = topic.get('summary', '')
+                        if topic_title or topic_summary:
+                            all_results.append({
+                                'content': f"【主题：{topic_title}】\n{topic_summary}",
+                                'source': f"Bundle {bundle_id} - Topic {topic.get('topic_id', '')} (分数: {topic.get('score', 0):.3f})",
+                                'type': 'text',
+                                'score': topic.get('score', 0.0),
+                                'page_number': f'Bundle {bundle_id}'
+                            })
+                
+                # 处理recent_turns（最近对话）
+                recent_turns = search_results.get('recent_turns', {})
+                recent_conversations = recent_turns.get('conversations', [])
+                for conv in recent_conversations:
+                    text_content = conv.get('text', '')
+                    if text_content:
                         all_results.append({
-                            'content': f"{content}",
-                            'source': f"第{page_number}页{source_type} (混合分数: {mixed_score:.3f})",
+                            'content': text_content,
+                            'source': f"Recent - Conversation {conv.get('conversation_id', '')} (分数: {conv.get('score', 0):.3f})",
                             'type': 'text',
-                            'score': mixed_score,
-                            'page_number': page_number,
-                            'similarity': similarity,
-                            'rerank_score': rerank_score
+                            'score': conv.get('score', 0.0),
+                            'page_number': 'Recent',
+                            'metadata': conv.get('metadata', {})
                         })
 
                 
-                # 分段搜索模式，不进行页数去重
+                # Bundle模式，不进行页数去重
                 
                 total_text = len([r for r in all_results if r.get('type') == 'text'])
                 total_image = len([r for r in all_results if r.get('type') == 'image'])

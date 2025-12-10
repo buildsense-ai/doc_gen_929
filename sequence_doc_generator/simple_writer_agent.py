@@ -105,10 +105,10 @@ class SimpleWriterAgent:
     
     def _parse_rag_results(self, results: Dict[str, Any]) -> Dict[str, List[Dict[str, Any]]]:
         """
-        解析RAG API返回的结果
+        解析RAG API返回的结果（Bundle格式）
         
         Args:
-            results: RAG API返回的原始结果
+            results: RAG API返回的原始结果（包含bundles, short_term_memory, recent_turns）
         
         Returns:
             解析后的结果字典
@@ -117,74 +117,87 @@ class SimpleWriterAgent:
         retrieved_image = []
         retrieved_table = []
         
-        # 获取结果数据
-        data = results.get('data', {})
-        result_list = data.get('results', [])
+        # 新API返回格式包含bundles
+        bundles = results.get('bundles', [])
         
-        if not result_list:
-            self.logger.warning("RAG结果中没有找到 'results' 字段")
+        if not bundles:
+            self.logger.warning("RAG结果中没有找到 'bundles' 字段")
             return {
                 "retrieved_text": [],
                 "retrieved_image": [],
                 "retrieved_table": []
             }
         
-        # 解析每个结果项
-        for idx, item in enumerate(result_list):
-            # 提取文本内容
-            content = item.get('content', '')
-            if content:
+        # 解析每个Bundle
+        for bundle_idx, bundle in enumerate(bundles):
+            bundle_id = bundle.get('bundle_id', bundle_idx)
+            
+            # 解析conversations（对话内容 -> 文本）
+            conversations = bundle.get('conversations', [])
+            for conv in conversations:
+                text_content = conv.get('text', '')
+                if text_content:
+                    text_entry = {
+                        'content': text_content,
+                        'source': f'Bundle {bundle_id} - Conversation {conv.get("conversation_id", "")}',
+                        'page_number': f'Bundle {bundle_id}',
+                        'relevance_score': conv.get('score', 0.0),
+                        'metadata': conv.get('metadata', {})
+                    }
+                    retrieved_text.append(text_entry)
+            
+            # 解析facts（事实内容 -> 文本 + 可能的图片）
+            facts = bundle.get('facts', [])
+            for fact in facts:
+                fact_content = fact.get('content', '')
+                if fact_content:
+                    text_entry = {
+                        'content': fact_content,
+                        'source': f'Bundle {bundle_id} - Fact {fact.get("fact_id", "")}',
+                        'page_number': f'Bundle {bundle_id}',
+                        'relevance_score': fact.get('score', 0.0),
+                        'metadata': fact.get('metadata', {})
+                    }
+                    retrieved_text.append(text_entry)
+                
+                # 如果fact包含图片
+                image_url = fact.get('image_url', '')
+                if image_url:
+                    image_entry = {
+                        'image_path': image_url,
+                        'page_number': f'Bundle {bundle_id}',
+                        'caption': fact_content[:100] if fact_content else f'Fact {fact.get("fact_id", "")}'
+                    }
+                    retrieved_image.append(image_entry)
+            
+            # 解析topics（主题内容 -> 文本）
+            topics = bundle.get('topics', [])
+            for topic in topics:
+                topic_title = topic.get('title', '')
+                topic_summary = topic.get('summary', '')
+                if topic_title or topic_summary:
+                    text_entry = {
+                        'content': f"【主题：{topic_title}】\n{topic_summary}",
+                        'source': f'Bundle {bundle_id} - Topic {topic.get("topic_id", "")}',
+                        'page_number': f'Bundle {bundle_id}',
+                        'relevance_score': topic.get('score', 0.0)
+                    }
+                    retrieved_text.append(text_entry)
+        
+        # 同时解析recent_turns中的对话（如果有）
+        recent_turns = results.get('recent_turns', {})
+        recent_conversations = recent_turns.get('conversations', [])
+        for conv in recent_conversations:
+            text_content = conv.get('text', '')
+            if text_content:
                 text_entry = {
-                    'content': content,
-                    'source': item.get('source', f'文档第{item.get("page_number", idx+1)}页'),
-                    'page_number': item.get('page_number', idx + 1),
-                    'relevance_score': item.get('similarity', 0.0)
+                    'content': text_content,
+                    'source': f'Recent - Conversation {conv.get("conversation_id", "")}',
+                    'page_number': 'Recent',
+                    'relevance_score': conv.get('score', 0.0),
+                    'metadata': conv.get('metadata', {})
                 }
                 retrieved_text.append(text_entry)
-            
-            # 提取图片
-            images = item.get('images', [])
-            if images:
-                for img in images:
-                    if isinstance(img, str):
-                        image_entry = {
-                            'image_path': img,
-                            'page_number': item.get('page_number', idx + 1),
-                            'caption': f"来自{item.get('source', '文档')}"
-                        }
-                    elif isinstance(img, dict):
-                        image_entry = {
-                            'image_path': img.get('path', img.get('url', '')),
-                            'page_number': item.get('page_number', idx + 1),
-                            'caption': img.get('caption', f"来自{item.get('source', '文档')}")
-                        }
-                    else:
-                        continue
-                    
-                    if image_entry['image_path']:
-                        retrieved_image.append(image_entry)
-            
-            # 提取表格
-            tables = item.get('tables', [])
-            if tables:
-                for tbl in tables:
-                    if isinstance(tbl, str):
-                        table_entry = {
-                            'table_path': tbl,
-                            'page_number': item.get('page_number', idx + 1),
-                            'caption': f"来自{item.get('source', '文档')}"
-                        }
-                    elif isinstance(tbl, dict):
-                        table_entry = {
-                            'table_path': tbl.get('path', tbl.get('data', '')),
-                            'page_number': item.get('page_number', idx + 1),
-                            'caption': tbl.get('caption', f"来自{item.get('source', '文档')}")
-                        }
-                    else:
-                        continue
-                    
-                    if table_entry['table_path']:
-                        retrieved_table.append(table_entry)
         
         return {
             "retrieved_text": retrieved_text,
