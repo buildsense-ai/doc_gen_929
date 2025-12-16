@@ -44,7 +44,7 @@ class ExternalAPIClient:
         # API服务器配置
         self.template_api_url = os.getenv("TEMPLATE_API_URL", "http://43.139.19.144:8003")
         self.rag_api_url = os.getenv("RAG_API_URL", "http://43.139.19.144:1234")
-        self.timeout = int(os.getenv("API_TIMEOUT", "30"))
+        self.timeout = int(os.getenv("API_TIMEOUT", "60"))
         self.skip_health_check = os.getenv("SKIP_HEALTH_CHECK", "false").lower() == "true"
         
         # 服务可用性标记
@@ -455,7 +455,7 @@ class ExternalAPIClient:
             request_data = {
                 "query": query,
                 "project_id": project_name,
-                "top_k": 5,
+                "top_k": 15,
                 "use_refine": False,
                 "use_graph_expansion": False
             }
@@ -512,7 +512,7 @@ class ExternalAPIClient:
             request_data = {
                 "query": query,
                 "project_id": project_name,  # 使用project_id而不是project_name
-                "top_k": 5,
+                "top_k": 15,
                 "use_refine": False,
                 "use_graph_expansion": False
             }
