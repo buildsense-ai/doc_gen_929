@@ -455,7 +455,7 @@ class ExternalAPIClient:
             request_data = {
                 "query": query,
                 "project_id": project_name,
-                "top_k": 15,
+                "top_k": 20,
                 "use_refine": False,
                 "use_graph_expansion": False
             }
@@ -512,7 +512,7 @@ class ExternalAPIClient:
             request_data = {
                 "query": query,
                 "project_id": project_name,  # 使用project_id而不是project_name
-                "top_k": 15,
+                "top_k": 20,
                 "use_refine": False,
                 "use_graph_expansion": False
             }
