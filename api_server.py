@@ -75,6 +75,7 @@ app.add_middleware(
 )
 
 internal_router = APIRouter(prefix="/internal", tags=["internal"])
+docasplan_writer_router = APIRouter(prefix="/api/docasplanwriter", tags=["docasplan_writer"])
 
 # 全局变量
 pipeline: Optional[DocumentGenerationPipeline] = None
@@ -606,6 +607,118 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "version": "1.0.0"
     }
+
+# ===== DocAsPlan Writer 接口 =====
+
+class DocAsPlanGlobalStyle(BaseModel):
+    tone: Optional[str] = None
+    language: Optional[str] = None
+    citation_style: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+class DocAsPlanTemplate(BaseModel):
+    template_id: Optional[str] = None
+    template_name: Optional[str] = None
+    template_structure: Optional[Dict[str, Any]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class DocAsPlanDocMeta(BaseModel):
+    version: Optional[int] = None
+    updated_at: Optional[int] = None
+    locked: Optional[bool] = None
+
+    class Config:
+        extra = "allow"
+
+
+class DocAsPlanDocJson(BaseModel):
+    doc_id: str = Field(..., description="文档ID")
+    title: Optional[str] = None
+    global_style: Optional[DocAsPlanGlobalStyle] = None
+    template: Optional[DocAsPlanTemplate] = None
+    rag_analysis: Optional[Dict[str, Any]] = None
+    markdown_text: str = Field(..., description="全文 markdown", min_length=1)
+    doc_meta: Optional[DocAsPlanDocMeta] = None
+
+    class Config:
+        extra = "allow"
+
+
+class DocAsPlanRagInfo(BaseModel):
+    key_facts: Optional[List[Dict[str, Any]]] = None
+    raw_chunks: Optional[List[Dict[str, Any]]] = None
+
+    class Config:
+        extra = "allow"
+
+
+class DocAsPlanWriterUpdateRequest(BaseModel):
+    doc_json: DocAsPlanDocJson
+    user_query: str = Field(..., min_length=1)
+    rag_info: Optional[DocAsPlanRagInfo] = None
+
+    class Config:
+        extra = "allow"
+
+
+class DocAsPlanWriterUpdateResponse(BaseModel):
+    doc_json: Dict[str, Any]
+    summary: Optional[str] = None
+
+    class Config:
+        extra = "allow"
+
+
+@docasplan_writer_router.post("/update_doc", response_model=DocAsPlanWriterUpdateResponse)
+async def docasplanwriter_update_doc(request: DocAsPlanWriterUpdateRequest):
+    """
+    DocAsPlan writer：根据 user_query 对论文 markdown_text（全文）进行局部插入/改写，并返回更新后的全文。
+    """
+    try:
+        if not request.doc_json or not request.doc_json.markdown_text or not request.doc_json.markdown_text.strip():
+            raise HTTPException(status_code=400, detail="doc_json.markdown_text 不能为空")
+        if not request.user_query or not request.user_query.strip():
+            raise HTTPException(status_code=400, detail="user_query 不能为空")
+
+        from clients.openrouter_client import OpenRouterClient
+        from Document_Agent.docasplan_writer_agent import DocAsPlanWriterAgent
+
+        llm_client = OpenRouterClient()
+        agent = DocAsPlanWriterAgent(llm_client)
+
+        rag_key_facts = []
+        if request.rag_info and request.rag_info.key_facts:
+            rag_key_facts = request.rag_info.key_facts
+
+        result = agent.update_markdown(
+            request.doc_json.markdown_text,
+            request.user_query,
+            doc_id=request.doc_json.doc_id,
+            global_style=request.doc_json.global_style.dict() if request.doc_json.global_style else None,
+            rag_key_facts=rag_key_facts,
+            existing_rag_analysis=request.doc_json.rag_analysis,
+        )
+
+        # 组装返回的 doc_json：透传原字段，仅覆盖 markdown_text 和 rag_analysis
+        out_doc_json = request.doc_json.dict()
+        out_doc_json["markdown_text"] = result.markdown_text
+        out_doc_json["rag_analysis"] = result.rag_analysis or {}
+
+        return DocAsPlanWriterUpdateResponse(
+            doc_json=out_doc_json,
+            summary=result.summary or None,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"docasplanwriter_update_doc failed: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="内部错误")
 
 @app.get("/logs/{task_id}/stream")
 async def stream_task_logs(task_id: str):
@@ -1367,6 +1480,7 @@ async def trigger_continue_signal(project_id: str, session_id: str):
 
 
 app.include_router(internal_router)
+app.include_router(docasplan_writer_router)
 
 @app.post("/sequence_generation/{project_id}/{session_id}/feedback")
 async def submit_feedback(project_id: str, session_id: str, request: FeedbackRequest):
