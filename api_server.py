@@ -643,7 +643,8 @@ class DocAsPlanDocJson(BaseModel):
     global_style: Optional[DocAsPlanGlobalStyle] = None
     template: Optional[DocAsPlanTemplate] = None
     rag_analysis: Optional[Dict[str, Any]] = None
-    markdown_text: str = Field(..., description="全文 markdown", min_length=1)
+    # 允许空/短输入：由 writer agent 决定是生成 plan 还是按章改写，并由上游(8000)在落盘前兜底回退旧全文
+    markdown_text: Optional[str] = Field(default="", description="全文 markdown（可为空，writer 将生成 plan 或补全）")
     doc_meta: Optional[DocAsPlanDocMeta] = None
 
     class Config:
@@ -681,8 +682,8 @@ async def docasplanwriter_update_doc(request: DocAsPlanWriterUpdateRequest):
     DocAsPlan writer：根据 user_query 对论文 markdown_text（全文）进行局部插入/改写，并返回更新后的全文。
     """
     try:
-        if not request.doc_json or not request.doc_json.markdown_text or not request.doc_json.markdown_text.strip():
-            raise HTTPException(status_code=400, detail="doc_json.markdown_text 不能为空")
+        if not request.doc_json:
+            raise HTTPException(status_code=400, detail="doc_json 不能为空")
         if not request.user_query or not request.user_query.strip():
             raise HTTPException(status_code=400, detail="user_query 不能为空")
 
